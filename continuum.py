@@ -1,13 +1,14 @@
 """Continuum: accountability memory demo for autonomous agents."""
 from __future__ import annotations
-import argparse, hashlib, json, os, subprocess, tempfile
+import argparse, hashlib, json, os, tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 MEMORY_FILE = DATA / "sibyl_memory.json"
-SIBYL_DB = Path(os.getenv('SIBYL_MEMORY_DB', str(DATA / 'sibyl_memory.db')))
+SIBYL_DB = Path(os.getenv('SIBYL_MEMORY_DB', str(DATA / 'sibyl_memory.db'))).resolve()
+SIBYL_TENANT = os.getenv('SIBYL_TENANT_ID','00000000-0000-0000-0000-000000000001')
 REPUTATION_FILE = DATA / "reputation.json"
 try:
     from dotenv import load_dotenv
@@ -19,14 +20,14 @@ def now(): return datetime.now(timezone.utc)
 def iso(dt): return dt.astimezone(timezone.utc).isoformat()
 
 class SibylMemory:
-    """Durable store. Uses Sibyl CLI when SIBYL_MEMORY_COMMAND is configured."""
+    """Durable operational memory backed by the official Sibyl SDK."""
     def __init__(self, path=MEMORY_FILE):
         self.path = Path(path); self.path.parent.mkdir(parents=True, exist_ok=True)
         self._sdk = None
         if os.getenv('CONTINUUM_MEMORY_BACKEND', 'sibyl-sdk') == 'sibyl-sdk' and self.path == MEMORY_FILE:
             try:
                 from sibyl_memory_client import MemoryClient
-                self._sdk = MemoryClient.local(os.getenv('SIBYL_MEMORY_DB', str(SIBYL_DB)), tenant_id=os.getenv('SIBYL_TENANT_ID','continuum'))
+                self._sdk = MemoryClient.local(str(Path(os.getenv('SIBYL_MEMORY_DB', str(SIBYL_DB))).resolve()), tenant_id=os.getenv('SIBYL_TENANT_ID', SIBYL_TENANT))
             except ImportError as exc:
                 raise RuntimeError('Sibyl SDK is required; install requirements.txt or set CONTINUUM_MEMORY_BACKEND=json') from exc
     REQUIRED_FIELDS = {'ticket_id','customer_id','vendor_id','issue_summary','promise_made','promised_date','status','escalation_count','resolution_credit','attestation_tx_hash','attestation_timestamp','last_action'}
@@ -53,34 +54,24 @@ class SibylMemory:
             existing=self.get(ticket['ticket_id'])
             if existing and existing.get('status')=='broken' and ticket.get('status')=='pending': raise ValueError('cannot overwrite a broken ticket with pending state')
             self._sdk.set_entity('ticket',ticket['ticket_id'],ticket,status=ticket['status']); return
-        if os.getenv('SIBYL_MEMORY_COMMAND'):
-            subprocess.run([os.environ['SIBYL_MEMORY_COMMAND'],'put',ticket['ticket_id'],json.dumps(ticket)],check=True)
-            return
         data=self._load(); existing=data.get(ticket['ticket_id'])
         if existing and existing.get('status')=='broken' and ticket.get('status')=='pending':
             raise ValueError('cannot overwrite a broken ticket with pending state')
         data[ticket['ticket_id']]=ticket; self._save(data)
     def get(self, ticket_id):
         if self._sdk:
+            from sibyl_memory_client.exceptions import NotFoundError
             try: return self._sdk.get_entity('ticket',ticket_id).get('body')
-            except Exception: return None
-        if os.getenv('SIBYL_MEMORY_COMMAND'):
-            result=subprocess.run([os.environ['SIBYL_MEMORY_COMMAND'],'get',ticket_id],check=True,capture_output=True,text=True)
-            return json.loads(result.stdout) if result.stdout.strip() else None
+            except NotFoundError: return None
         ticket=self._load().get(ticket_id); return self._validate(ticket) if ticket else None
     def all(self):
         if self._sdk: return [self._validate(x['body']) for x in self._sdk.list_entities('ticket',limit=10000)]
-        if os.getenv('SIBYL_MEMORY_COMMAND'):
-            result=subprocess.run([os.environ['SIBYL_MEMORY_COMMAND'],'list','--json'],check=True,capture_output=True,text=True)
-            return json.loads(result.stdout)
         return [self._validate(t) for t in self._load().values()]
     def clear(self):
         if self._sdk:
             for row in self._sdk.list_entities('ticket',limit=10000): self._sdk.delete_entity('ticket',row['name'])
             return
-        if os.getenv('SIBYL_MEMORY_COMMAND'):
-            subprocess.run([os.environ['SIBYL_MEMORY_COMMAND'],'clear'],check=True)
-        else: self._save({})
+        self._save({})
 
     @property
     def backend_name(self):
@@ -145,7 +136,7 @@ def process_ticket(ticket, memory, proactive=False):
         print('Consequence already applied. Retrying missing Base attestation only.')
         try:
             txh,ts,_=BaseAttestation().record_attestation(ticket['vendor_id'],ticket['ticket_id'],ticket['promise_made'],ticket['promised_date'])
-            ticket['attestation_tx_hash']=txh; ticket['attestation_timestamp']=ts; memory.put(ticket); update_reputation(ticket, attestation_confirmed=True)
+            ticket['attestation_tx_hash']=txh; ticket['attestation_timestamp']=ts; memory.put(ticket)
             print('BASE ATTESTATION SUBMITTED\nTransaction confirmed\nTX:',txh)
         except Exception as exc: print('BASE ATTESTATION PENDING:',exc)
         return ticket
@@ -158,28 +149,43 @@ def process_ticket(ticket, memory, proactive=False):
     days=max(1,int(late)); ticket['status']='broken'; ticket['escalation_count'] += 1; ticket['resolution_credit']=credit_for(days); ticket['last_action']='deadline breach detected and escalated'
     print('\nCOMMITMENT BROKEN\nDeadline passed.\n Escalating\n Calculating credit: $%s\n' % ticket['resolution_credit'])
     flow=VirtualsCoordinator().coordinate(ticket); print('VIRTUALS COORDINATION'); print(' -> '.join(flow['agents']))
-    memory.put(ticket); update_reputation(ticket, breach_event=True)
+    memory.put(ticket)
     try:
         txh,ts,payload=BaseAttestation().record_attestation(ticket['vendor_id'],ticket['ticket_id'],ticket['promise_made'],ticket['promised_date'])
-        ticket['attestation_tx_hash']=txh; ticket['attestation_timestamp']=ts; ticket['last_action']='Base attestation confirmed'; memory.put(ticket); update_reputation(ticket, attestation_confirmed=True)
+        ticket['attestation_tx_hash']=txh; ticket['attestation_timestamp']=ts; ticket['last_action']='Base attestation confirmed'; memory.put(ticket)
         print('BASE ATTESTATION SUBMITTED\nTransaction confirmed\nTX:',txh)
     except Exception as exc:
         print('BASE ATTESTATION PENDING:',exc)
     return ticket
 
-def update_reputation(ticket, breach_event=False, attestation_confirmed=False):
+def update_reputation(ticket, promise_created=False, breach_event=False, attestation_confirmed=False):
     data=json.loads(REPUTATION_FILE.read_text()) if REPUTATION_FILE.exists() else {'vendor_reliability_profile':{},'agent_reputation':{'agent_id':'continuum-support-01','tickets_processed':0,'promises_tracked':0,'broken_promises_detected':0,'correct_escalations':0,'false_escalations':0,'escalation_accuracy':1.0,'total_credit_recovered':0,'attestations_created':0}}
     v=data['vendor_reliability_profile'].setdefault(ticket['vendor_id'],{'promises_total':0,'promises_broken':0,'reliability_score':1.0,'average_delay_days':0,'total_resolution_credit':0,'attestations':0})
+    if promise_created: v['promises_total']+=1
     if breach_event:
-        v['promises_total']+=1; v['promises_broken']+=1; v['total_resolution_credit']+=ticket['resolution_credit']
+        v['promises_broken']+=1; v['total_resolution_credit']+=ticket['resolution_credit']
         a=data['agent_reputation']; a['tickets_processed']+=1; a['promises_tracked']+=1; a['broken_promises_detected']+=1; a['correct_escalations']+=1; a['total_credit_recovered']+=ticket['resolution_credit']; a['escalation_accuracy']=round(a['correct_escalations']/max(1,a['correct_escalations']+a['false_escalations']),3)
     if attestation_confirmed:
         v['attestations']+=1; data['agent_reputation']['attestations_created']+=1
     v['reliability_score']=round(1-v['promises_broken']/max(1,v['promises_total']),3)
     REPUTATION_FILE.write_text(json.dumps(data,indent=2))
 
+def rebuild_reputation(memory):
+    """Derive reputation from durable tickets; never trust stale counters."""
+    tickets=memory.all(); vendors={}
+    for t in tickets:
+        v=vendors.setdefault(t['vendor_id'], {'promises_total':0,'promises_broken':0,'reliability_score':1.0,'average_delay_days':0,'total_resolution_credit':0,'attestations':0})
+        v['promises_total']+=1
+        if t['status']=='broken':
+            v['promises_broken']+=1; v['total_resolution_credit']+=t['resolution_credit']
+        if t.get('attestation_tx_hash'): v['attestations']+=1
+    for v in vendors.values(): v['reliability_score']=round(1-v['promises_broken']/max(1,v['promises_total']),3)
+    broken=[t for t in tickets if t['status']=='broken']
+    return {'vendor_reliability_profile':vendors,'agent_reputation':{'agent_id':'continuum-support-01','tickets_processed':len(broken),'promises_tracked':len(tickets),'broken_promises_detected':len(broken),'correct_escalations':len(broken),'false_escalations':0,'escalation_accuracy':1.0 if broken else 1.0,'total_credit_recovered':sum(t['resolution_credit'] for t in broken),'attestations_created':sum(bool(t.get('attestation_tx_hash')) for t in tickets)}}
+
 def create_ticket(memory, ticket_id, customer_id, vendor_id, issue_summary, promise_made, promised_date):
     ticket={'ticket_id':ticket_id,'customer_id':customer_id,'vendor_id':vendor_id,'issue_summary':issue_summary,'promise_made':promise_made,'promised_date':promised_date,'status':'pending','escalation_count':0,'resolution_credit':0,'attestation_tx_hash':None,'attestation_timestamp':None,'last_action':'promise recorded'}
+    if memory.get(ticket_id): raise ValueError(f'ticket already exists: {ticket_id}')
     memory.put(ticket); print(json.dumps(ticket, indent=2))
 
 def session1(memory):
@@ -207,11 +213,11 @@ def main():
     elif a.command=='check-deadlines': check_deadlines(m)
     elif a.command=='clear-memory': m.clear(); print('Sibyl Memory cleared. Memory-off run cannot recall commitments.')
     elif a.command=='doctor':
-        result={'memory_backend':m.backend_name,'sibyl_command':os.getenv('SIBYL_MEMORY_COMMAND'),'claude_configured':bool(os.getenv('ANTHROPIC_API_KEY') or os.getenv('ANTHROPIC_AUTH_TOKEN')),'base_configured':bool(os.getenv('BASE_PRIVATE_KEY') and os.getenv('BASE_RPC_URL')),'virtuals_configured':bool(os.getenv('VIRTUALS_ACP_URL') and os.getenv('VIRTUALS_API_KEY'))}
+        result={'memory_backend':m.backend_name,'sibyl_db':str(Path(os.getenv('SIBYL_MEMORY_DB', str(SIBYL_DB))).resolve()),'sibyl_tenant':os.getenv('SIBYL_TENANT_ID', SIBYL_TENANT),'claude_configured':bool(os.getenv('ANTHROPIC_API_KEY') or os.getenv('ANTHROPIC_AUTH_TOKEN')),'base_configured':bool(os.getenv('BASE_PRIVATE_KEY') and os.getenv('BASE_RPC_URL')),'virtuals_configured':bool(os.getenv('VIRTUALS_ACP_URL') and os.getenv('VIRTUALS_API_KEY'))}
         if a.strict and result['memory_backend']!='sibyl-sdk-sqlite': raise SystemExit('strict mode requires the Sibyl Memory SDK')
         print(json.dumps(result,indent=2))
     elif a.command=='create-ticket':
         if not a.promised_date: p.error('create-ticket requires --promised-date')
         create_ticket(m,a.ticket_id,a.customer_id,a.vendor_id,a.issue_summary,a.promise_made,a.promised_date)
-    else: print(json.dumps(json.loads(REPUTATION_FILE.read_text()) if REPUTATION_FILE.exists() else {},indent=2))
+    else: print(json.dumps(rebuild_reputation(m),indent=2))
 if __name__=='__main__': main()

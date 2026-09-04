@@ -22,7 +22,7 @@ Session 2 is a fresh process. It recalls the private operational record, detects
 
 `session3` proves idempotency: an already broken ticket with an attestation produces no second credit or transaction. Run `python continuum.py clear-memory` before the same session to demonstrate that memory-off cannot discover the prior commitment.
 
-The Sibyl SDK stores ticket entities in `SIBYL_MEMORY_DB` (default `data/sibyl_memory.db`) and survives process restarts. The `sibyl` CLI can inspect that same store when configured with the matching `--db` path. Detailed customer data never enters the Base payload: only hashes, deadline, and breach time do.
+The Sibyl SDK stores ticket entities in `SIBYL_MEMORY_DB` (default `data/sibyl_memory.db`) and survives process restarts. Continuum uses Sibyl's canonical default tenant unless `SIBYL_TENANT_ID` is explicitly set; use the same tenant when inspecting the store with the CLI. Detailed customer data never enters the Base payload: only hashes, deadline, and breach time do.
 
 Set `VIRTUALS_ACP_URL` and `VIRTUALS_API_KEY` to send the three-role workflow to a Virtuals-native ACP endpoint. Without them, output is labeled `local-development`; it is not presented as a live Virtuals run.
 
