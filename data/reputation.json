@@ -1,23 +1,14 @@
 {
-  "vendor_reliability_profile": {
-    "V-001": {
-      "promises_total": 100,
-      "promises_broken": 9,
-      "reliability_score": 0.91,
-      "average_delay_days": 1.4,
-      "total_resolution_credit": 380,
-      "attestations": 9
-    }
-  },
+  "vendor_reliability_profile": {},
   "agent_reputation": {
     "agent_id": "continuum-support-01",
-    "tickets_processed": 47,
-    "promises_tracked": 43,
-    "broken_promises_detected": 10,
-    "correct_escalations": 9,
-    "false_escalations": 1,
-    "escalation_accuracy": 0.9,
-    "total_credit_recovered": 160,
-    "attestations_created": 10
+    "tickets_processed": 0,
+    "promises_tracked": 0,
+    "broken_promises_detected": 0,
+    "correct_escalations": 0,
+    "false_escalations": 0,
+    "escalation_accuracy": 1.0,
+    "total_credit_recovered": 0,
+    "attestations_created": 0
   }
 }

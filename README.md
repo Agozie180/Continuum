@@ -13,15 +13,16 @@ python continuum.py session1
 python continuum.py session2 T-1042
 python continuum.py session3 T-1042
 python continuum.py check-deadlines
+python continuum.py create-ticket T-NEW --customer-id C-NEW --vendor-id V-NEW --issue-summary "Issue" --promise-made "Resolve by Friday" --promised-date 2026-09-10T17:00:00+00:00
 ```
 
-`doctor` is the required preflight. It reports whether Claude, Sibyl CLI, Base, and Virtuals are actually configured. Configure the corresponding values in `.env`; no integration is silently claimed as live.
+`doctor` is the required preflight. The default backend is the installed Sibyl Memory SDK with a durable SQLite store. Use `python continuum.py doctor --strict` in a judged/live environment; it refuses to run if the SDK is unavailable. Set `CONTINUUM_MEMORY_BACKEND=json` only for isolated tests. Configure the corresponding values in `.env`; no integration is silently claimed as live.
 
 Session 2 is a fresh process. It recalls the private operational record, detects the expired promise, coordinates Support/Accountability/Reputation agents via the Virtuals ACP adapter, calculates a deterministic credit, and writes a safe hashed payload to Base. `BASE_PRIVATE_KEY` and `BASE_RPC_URL` are required: the app never fabricates a transaction hash. Without credentials the consequence is persisted once and the missing attestation is retried later without issuing a second credit.
 
 `session3` proves idempotency: an already broken ticket with an attestation produces no second credit or transaction. Run `python continuum.py clear-memory` before the same session to demonstrate that memory-off cannot discover the prior commitment.
 
-Set `SIBYL_MEMORY_COMMAND=sibyl-memory-cli` to route put/get/list operations through the installed CLI. The local JSON backend is explicitly for development and the memory-off experiment. This machine did not expose `sibyl-memory-cli` on `PATH`, so live Sibyl execution must be verified after activating that installation. Detailed customer data never enters the Base payload: only hashes, deadline, and breach time do.
+The Sibyl SDK stores ticket entities in `SIBYL_MEMORY_DB` (default `data/sibyl_memory.db`) and survives process restarts. The `sibyl` CLI can inspect that same store when configured with the matching `--db` path. Detailed customer data never enters the Base payload: only hashes, deadline, and breach time do.
 
 Set `VIRTUALS_ACP_URL` and `VIRTUALS_API_KEY` to send the three-role workflow to a Virtuals-native ACP endpoint. Without them, output is labeled `local-development`; it is not presented as a live Virtuals run.
 

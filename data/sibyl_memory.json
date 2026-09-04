@@ -1,16 +1,1 @@
-{
-  "T-1042": {
-    "ticket_id": "T-1042",
-    "customer_id": "C-001",
-    "vendor_id": "V-001",
-    "issue_summary": "Package has not arrived.",
-    "promise_made": "Resolve delivery issue",
-    "promised_date": "2026-08-18T17:00:00+00:00",
-    "status": "broken",
-    "escalation_count": 1,
-    "resolution_credit": 20,
-    "attestation_tx_hash": null,
-    "attestation_timestamp": null,
-    "last_action": "deadline breach detected and escalated"
-  }
-}
+{}
