@@ -5,6 +5,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / '.env')
+except ImportError:
+    pass
+
 ROOT=Path(__file__).resolve().parent; DATA=ROOT/'data'; SIBYL_DB=Path(os.getenv('SIBYL_MEMORY_DB',str(DATA/'sibyl_memory.db'))).resolve(); SIBYL_TENANT=os.getenv('SIBYL_TENANT_ID','00000000-0000-0000-0000-000000000001')
 REQUIRED={'ticket_id','customer_id','vendor_id','issue_summary','promise_made','promised_date','status','escalation_count','resolution_credit','attestation_tx_hash','attestation_timestamp','last_action','breach_event_id','attestation_intent','virtuals_event_id'}
 def now(): return datetime.now(timezone.utc)
