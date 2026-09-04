@@ -3,3 +3,4 @@ anthropic>=0.30.0
 python-dotenv>=1.0.0
 requests>=2.31.0
 sibyl-memory-client>=0.8.0
+sibyl-memory-cli[mcp]>=0.4.0

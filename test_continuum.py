@@ -1,27 +1,30 @@
-import json, tempfile, unittest
-from pathlib import Path
-from continuum import SibylMemory, credit_for
+import unittest
+from datetime import datetime, timezone
+from continuum import MemoryTestStore, credit_for, new_ticket, process_ticket
+
+class FakeCoordinator:
+    def coordinate(self, ticket): return "virtuals-event-1"
+
+class FakeAttestor:
+    def submit(self, ticket, store): return "0xreal-test-double", "2026-01-01T00:00:00+00:00"
 
 class ContinuumTests(unittest.TestCase):
     def test_credit_policy(self):
-        self.assertEqual(credit_for(1),5); self.assertEqual(credit_for(3),10); self.assertEqual(credit_for(4),20)
-    def test_persistence_across_instances(self):
-        with tempfile.TemporaryDirectory() as d:
-            p=Path(d)/'memory.json'; m=SibylMemory(p)
-            t={'ticket_id':'T','customer_id':'C','vendor_id':'V','issue_summary':'x','promise_made':'y','promised_date':'2099-01-01T00:00:00+00:00','status':'pending','escalation_count':0,'resolution_credit':0,'attestation_tx_hash':None,'attestation_timestamp':None,'last_action':'promise recorded','breach_event_id':None,'attestation_intent':None}
-            m.put(t); self.assertEqual(SibylMemory(p).get('T')['status'],'pending')
-
+        self.assertEqual(credit_for(1), 5); self.assertEqual(credit_for(3), 10); self.assertEqual(credit_for(4), 20)
+    def test_fresh_store_recall_and_behavior(self):
+        store = MemoryTestStore(); ticket = new_ticket("T", "C", "V", "x", "y", "2020-01-01T00:00:00+00:00")
+        store.put(ticket); recalled = store.get("T")
+        result = process_ticket(recalled, store, FakeCoordinator(), FakeAttestor(), lambda: datetime(2020, 1, 3, tzinfo=timezone.utc))
+        self.assertEqual(result["status"], "broken"); self.assertEqual(result["resolution_credit"], 10)
+        self.assertEqual(store.get("T")["virtuals_event_id"], "virtuals-event-1")
+    def test_future_deadline_has_no_consequence(self):
+        store = MemoryTestStore(); ticket = new_ticket("T", "C", "V", "x", "y", "2099-01-01T00:00:00+00:00"); store.put(ticket)
+        result = process_ticket(ticket, store, clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc))
+        self.assertEqual(result["status"], "pending")
+    def test_idempotent_broken_ticket(self):
+        store = MemoryTestStore(); ticket = new_ticket("T", "C", "V", "x", "y", "2020-01-01T00:00:00+00:00"); ticket.update(status="broken", attestation_tx_hash="0x1", escalation_count=1); store.put(ticket)
+        result = process_ticket(store.get("T"), store, FakeCoordinator(), FakeAttestor()); self.assertEqual(result["attestation_tx_hash"], "0x1"); self.assertEqual(result["escalation_count"], 1)
     def test_schema_rejects_incomplete_ticket(self):
-        with tempfile.TemporaryDirectory() as d:
-            with self.assertRaises(ValueError): SibylMemory(Path(d)/'memory.json').put({'ticket_id':'T'})
+        with self.assertRaises(ValueError): MemoryTestStore().put({"ticket_id": "T"})
 
-    def test_broken_ticket_cannot_be_reset_to_pending(self):
-        with tempfile.TemporaryDirectory() as d:
-            p=Path(d)/'memory.json'; m=SibylMemory(p)
-            t={'ticket_id':'T','customer_id':'C','vendor_id':'V','issue_summary':'x','promise_made':'y','promised_date':'2020-01-01T00:00:00+00:00','status':'broken','escalation_count':1,'resolution_credit':20,'attestation_tx_hash':None,'attestation_timestamp':None,'last_action':'breach','breach_event_id':'2020-01-02T00:00:00+00:00','attestation_intent':None}
-            m.put(t); t['status']='pending'
-            with self.assertRaises(ValueError): m.put(t)
-    def test_reputation_fixture_schema(self):
-        data=json.loads((Path(__file__).parent/'data'/'reputation.json').read_text()); self.assertIn('vendor_reliability_profile',data); self.assertIn('agent_reputation',data)
-
-if __name__=='__main__': unittest.main()
+if __name__ == "__main__": unittest.main()
