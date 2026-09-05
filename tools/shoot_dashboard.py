@@ -16,10 +16,7 @@ from PIL import Image, ImageDraw, ImageFont
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import continuum as c  # noqa: E402
 
-# Dark theme tuned to read like the hackathon site.
-BG = (13, 17, 23)
-FG = (201, 209, 217)
-DIM = (110, 118, 129)
+BG = (13, 17, 23)  # dark ground, tuned to read like the hackathon site
 PAD = 28
 LINE_SPACING = 6
 
@@ -33,25 +30,30 @@ def _mono_font(size=22):
     return ImageFont.load_default()
 
 
-def render(text: str, out_path: Path) -> Path:
-    font = _mono_font(22)
-    lines = text.split("\n")
+def render(rows, out_path: Path) -> Path:
+    """Paint the structured dashboard rows (segment lists) to a PNG.
 
-    # Measure using the widest line so the frame never clips.
+    Each row is a list of ``(text, palette_key)`` segments; segments are drawn
+    left-to-right on a fixed-width grid so color never shifts the layout.
+    """
+    font = _mono_font(22)
     tmp = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    char_w = tmp.textlength("M", font=font)
+    char_w = tmp.textlength("M", font=font)  # monospace: every glyph same width
     ascent, descent = font.getmetrics()
     row_h = ascent + descent + LINE_SPACING
-    width = int(max(tmp.textlength(ln, font=font) for ln in lines) + PAD * 2)
-    height = int(row_h * len(lines) + PAD * 2)
+
+    cols = max(sum(len(t) for t, _ in row) for row in rows)
+    width = int(char_w * cols + PAD * 2)
+    height = int(row_h * len(rows) + PAD * 2)
 
     img = Image.new("RGB", (width, height), BG)
     draw = ImageDraw.Draw(img)
     y = PAD
-    for ln in lines:
-        # The trailing caption line is drawn dimmed.
-        color = DIM if ln.startswith("read-only view") else FG
-        draw.text((PAD, y), ln, font=font, fill=color)
+    for row in rows:
+        x = PAD
+        for text, key in row:
+            draw.text((x, y), text, font=font, fill=c.PALETTE.get(key, c.PALETTE["fg"]))
+            x += char_w * len(text)
         y += row_h
 
     img.save(out_path)
@@ -61,8 +63,8 @@ def render(text: str, out_path: Path) -> Path:
 def main():
     out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / "Downloads" / "continuum-dashboard.png"
     out.parent.mkdir(parents=True, exist_ok=True)
-    text = c.render_dashboard(c.SibylMemory())
-    saved = render(text, out)
+    rows = c._dashboard_rows(c.SibylMemory())
+    saved = render(rows, out)
     print(f"Wrote {saved}  ({saved.stat().st_size} bytes)")
 
 

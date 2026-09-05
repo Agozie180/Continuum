@@ -606,76 +606,143 @@ class VirtualsCoordinator:
 # the tail of the consequence ledger, and renders them. It has NO side effects -
 # it never advances the saga and never broadcasts on-chain.
 # --------------------------------------------------------------------------- #
-_PHASE_GLYPH = {"OPEN": "○", "BREACHED": "◐", "ATTESTED": "◑", "CLOSED": "●"}
+# Glyphs chosen to render in the common terminal fonts (notably Consolas, which
+# lacks the half-circle glyphs): empty ring -> lozenge -> solid square (anchored)
+# -> full circle (done), a legible "increasing completion" progression.
+_PHASE_GLYPH = {"OPEN": "○", "BREACHED": "◊", "ATTESTED": "■", "CLOSED": "●"}
 _TIER_LABEL = {"trusted": "TRUSTED", "standard": "STANDARD", "watch": "WATCH", "high-risk": "HIGH-RISK"}
+_DASHBOARD_WIDTH = 78
+
+# A single named palette drives both the ANSI terminal output and the PNG
+# render, so the two never drift. Values are RGB; the ANSI layer maps them to
+# 24-bit truecolor escapes.
+PALETTE = {
+    "fg": (201, 209, 217),      # default text
+    "dim": (110, 118, 129),     # captions, hashes, table headings
+    "border": (88, 166, 255),   # frame - blue
+    "title": (86, 211, 255),    # CONTINUUM - cyan
+    "brand": (63, 185, 80),     # "memory: Sibyl" - green
+    "section": (210, 168, 255), # section headings - purple
+    "id": (121, 192, 255),      # ticket ids - light blue
+    "open": (88, 166, 255),     # phase: OPEN - blue
+    "breached": (233, 180, 76), # phase: BREACHED - amber
+    "attested": (210, 168, 255),# phase: ATTESTED - purple
+    "closed": (63, 185, 80),    # phase: CLOSED - green
+    "good": (63, 185, 80),      # green (resolved, trusted, filled bar)
+    "warn": (233, 180, 76),     # amber (watch, pending)
+    "bad": (248, 120, 120),     # red (broken, high-risk, breach)
+    "cyan": (86, 211, 255),
+    "magenta": (210, 168, 255),
+}
+_PHASE_COLOR = {"OPEN": "open", "BREACHED": "breached", "ATTESTED": "attested", "CLOSED": "closed"}
+_TIER_COLOR = {"trusted": "good", "standard": "cyan", "watch": "warn", "high-risk": "bad"}
+_STATUS_COLOR = {"pending": "warn", "broken": "bad", "resolved": "good"}
+_KIND_COLOR = {"breach": "bad", "attest": "magenta", "close": "good"}
 
 
-def render_dashboard(memory) -> str:
-    """Build the dashboard text from durable Sibyl memory (no side effects)."""
+def _dashboard_rows(memory):
+    """Structured dashboard as a list of rows, each a list of (text, color) segments.
+
+    This is the single source of truth for the view. Serializing it plain
+    (``render_dashboard``), to ANSI (``render_dashboard(color=True)``), or to a
+    PNG (``tools/shoot_dashboard.py``) all consume these same segments, so
+    layout and color never diverge. Purely derived from durable memory.
+    """
     tickets = sorted(memory.all(), key=lambda t: t["ticket_id"])
     agent = memory.agent_reputation()
     vendor_ids = sorted({t["vendor_id"] for t in tickets})
-    W = 78
-    out = []
+    W = _DASHBOARD_WIDTH
+    rows = []
 
-    def row(text=""):
-        # One framed line, padded to a uniform interior width so every right
-        # border aligns regardless of the content length.
-        out.append("│" + (" " + text).ljust(W) + "│")
+    def frame(segments):
+        # Pad to a uniform interior width (computed on visible text only, so
+        # color never throws the right border off) and add the side borders.
+        visible = sum(len(t) for t, _ in segments)
+        pad = max(0, W - 1 - visible)
+        rows.append([("│", "border"), (" ", "fg"), *segments, (" " * pad, "fg"), ("│", "border")])
 
     def rule(left="├", right="┤"):
-        out.append(left + "─" * W + right)
+        rows.append([(left + "─" * W + right, "border")])
 
     rule("┌", "┐")
-    head = "CONTINUUM · accountability runtime"
+    head = [("CONTINUUM", "title"), (" · accountability runtime", "dim")]
     tail = "memory: Sibyl"
-    out.append("│" + (" " + head).ljust(W - len(tail) - 1) + tail + " │")
+    gap = W - 1 - sum(len(t) for t, _ in head) - len(tail)
+    rows.append([("│", "border"), (" ", "fg"), *head, (" " * max(0, gap), "fg"),
+                 (tail, "brand"), (" ", "fg"), ("│", "border")])
     rule()
 
     # -- agent reputation (HOT state, compounding) ------------------------- #
-    row("AGENT REPUTATION (compounding, derived from durable history)")
-    row(f"  tickets={agent['tickets_processed']}  breaches={agent['breaches_detected']}  "
-        f"escalations={agent['escalations_issued']}  credit_recovered={agent['credit_recovered']}  "
-        f"attestations={agent['attestations_created']}")
+    frame([("AGENT REPUTATION ", "section"), ("(compounding, derived from durable history)", "dim")])
+    frame([("  tickets=", "dim"), (str(agent["tickets_processed"]), "fg"),
+           ("  breaches=", "dim"), (str(agent["breaches_detected"]), "bad"),
+           ("  escalations=", "dim"), (str(agent["escalations_issued"]), "warn"),
+           ("  credit_recovered=", "dim"), (str(agent["credit_recovered"]), "good"),
+           ("  attestations=", "dim"), (str(agent["attestations_created"]), "magenta")])
     rule()
 
     # -- tickets (WARM entities; phase is the saga cursor) ----------------- #
-    row("COMMITMENTS")
-    row("  TICKET    VENDOR  PHASE          STATUS   ESC  CREDIT  ANCHOR")
+    frame([("COMMITMENTS", "section")])
+    frame([("  TICKET    VENDOR  PHASE          STATUS   ESC  CREDIT  ANCHOR", "dim")])
     if not tickets:
-        row("  (no commitments in memory - run: session1)")
+        frame([("  (no commitments in memory - run: session1)", "dim")])
     for t in tickets:
         glyph = _PHASE_GLYPH.get(t["phase"], "?")
+        pc = _PHASE_COLOR.get(t["phase"], "fg")
         tx = t.get("attestation_tx_hash")
         anchor = (tx[:10] + "…") if tx else "-"
-        row(f"  {t['ticket_id']:<9} {t['vendor_id']:<7} {glyph} {t['phase']:<12} "
-            f"{t['status']:<8} {t['escalation_level']:<4} {t['resolution_credit']:<6}  {anchor}")
+        frame([("  ", "fg"), (f"{t['ticket_id']:<9} ", "id"), (f"{t['vendor_id']:<7} ", "fg"),
+               (f"{glyph} {t['phase']:<12} ", pc), (f"{t['status']:<8} ", _STATUS_COLOR.get(t["status"], "fg")),
+               (f"{t['escalation_level']:<4} ", "warn"), (f"{t['resolution_credit']:<6}  ", "good"),
+               (anchor, "dim")])
     rule()
 
     # -- vendor reputation (WARM, derived; feeds forward into policy) ------ #
-    row("VENDOR REPUTATION (derived from history -> feeds the next consequence)")
+    frame([("VENDOR REPUTATION ", "section"), ("(derived from history -> feeds the next consequence)", "dim")])
     for vid in vendor_ids:
         v = memory.vendor_reputation(vid)
         bar_n = int(round(v["reliability"] * 10))
-        bar = "█" * bar_n + "░" * (10 - bar_n)
-        row(f"  {vid:<7} {_TIER_LABEL.get(v['tier'], v['tier']):<10} reliability {bar} "
-            f"{v['reliability']:.0%}   breaches {v['breaches']}/{v['commitments']}  "
-            f"credit {v['total_credit_charged']}")
+        rel_color = "good" if v["reliability"] >= 0.6 else "warn" if v["reliability"] >= 0.3 else "bad"
+        frame([("  ", "fg"), (f"{vid:<7} ", "id"),
+               (f"{_TIER_LABEL.get(v['tier'], v['tier']):<10} ", _TIER_COLOR.get(v["tier"], "fg")),
+               ("reliability ", "dim"), ("█" * bar_n, rel_color), ("░" * (10 - bar_n), "dim"),
+               (f" {v['reliability']:.0%}", rel_color),
+               (f"   breaches {v['breaches']}/{v['commitments']}", "dim"),
+               (f"  credit {v['total_credit_charged']}", "dim")])
     rule()
 
     # -- consequence ledger (COLD journal; evaluated/acted/forward) -------- #
-    row("CONSEQUENCE LEDGER (append-only: evaluated -> acted -> forward)")
+    frame([("CONSEQUENCE LEDGER ", "section"), ("(append-only: evaluated -> acted -> forward)", "dim")])
     events = memory.ledger(limit=6)
     if not events:
-        row("  (empty)")
+        frame([("  (empty)", "dim")])
     for ev in events:
         kind = ev.get("extra", {}).get("kind", ev.get("kind", "?"))
         tid = ev.get("extra", {}).get("ticket_id", ev.get("ticket_id", "?"))
         transition = ev.get("acted", {}).get("transition", "")
-        row(f"  [{kind:<6}] {tid:<9} {transition}")
+        frame([("  [", "dim"), (f"{kind:<6}", _KIND_COLOR.get(kind, "fg")), ("] ", "dim"),
+               (f"{tid:<9} ", "id"), (transition, "cyan")])
     rule("└", "┘")
-    out.append("read-only view · no saga advance · no broadcast · memory is the product")
-    return "\n".join(out)
+    rows.append([("read-only view · no saga advance · no broadcast · memory is the product", "dim")])
+    return rows
+
+
+_ANSI_RESET = "\x1b[0m"
+
+
+def _ansi(rgb):
+    return f"\x1b[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
+
+
+def render_dashboard(memory, color=False) -> str:
+    """Render the dashboard as text. With ``color`` true, emit ANSI truecolor."""
+    lines = []
+    for row in _dashboard_rows(memory):
+        if color:
+            lines.append("".join(_ansi(PALETTE[c]) + t + _ANSI_RESET for t, c in row))
+        else:
+            lines.append("".join(t for t, _ in row))
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -768,7 +835,9 @@ def main():
             sys.stdout.reconfigure(encoding="utf-8")
         except (AttributeError, ValueError):
             pass
-        print(render_dashboard(memory))
+        # Color when writing to a real terminal; plain when piped/redirected.
+        use_color = sys.stdout.isatty() and os.getenv("NO_COLOR") is None
+        print(render_dashboard(memory, color=use_color))
     elif args.command in ("session2", "session3"):
         # Detect and record the breach from fresh memory; never broadcasts.
         _run(memory, args.target, allow_attestation=False)
