@@ -34,6 +34,7 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -598,6 +599,86 @@ class VirtualsCoordinator:
 
 
 # --------------------------------------------------------------------------- #
+# Dashboard - a read-only, at-a-glance view of what Sibyl remembers
+#
+# This is a pure projection of durable memory: it recalls the agent reputation
+# state, every ticket (with its saga phase), the derived vendor reputation, and
+# the tail of the consequence ledger, and renders them. It has NO side effects -
+# it never advances the saga and never broadcasts on-chain.
+# --------------------------------------------------------------------------- #
+_PHASE_GLYPH = {"OPEN": "○", "BREACHED": "◐", "ATTESTED": "◑", "CLOSED": "●"}
+_TIER_LABEL = {"trusted": "TRUSTED", "standard": "STANDARD", "watch": "WATCH", "high-risk": "HIGH-RISK"}
+
+
+def render_dashboard(memory) -> str:
+    """Build the dashboard text from durable Sibyl memory (no side effects)."""
+    tickets = sorted(memory.all(), key=lambda t: t["ticket_id"])
+    agent = memory.agent_reputation()
+    vendor_ids = sorted({t["vendor_id"] for t in tickets})
+    W = 78
+    out = []
+
+    def row(text=""):
+        # One framed line, padded to a uniform interior width so every right
+        # border aligns regardless of the content length.
+        out.append("│" + (" " + text).ljust(W) + "│")
+
+    def rule(left="├", right="┤"):
+        out.append(left + "─" * W + right)
+
+    rule("┌", "┐")
+    head = "CONTINUUM · accountability runtime"
+    tail = "memory: Sibyl"
+    out.append("│" + (" " + head).ljust(W - len(tail) - 1) + tail + " │")
+    rule()
+
+    # -- agent reputation (HOT state, compounding) ------------------------- #
+    row("AGENT REPUTATION (compounding, derived from durable history)")
+    row(f"  tickets={agent['tickets_processed']}  breaches={agent['breaches_detected']}  "
+        f"escalations={agent['escalations_issued']}  credit_recovered={agent['credit_recovered']}  "
+        f"attestations={agent['attestations_created']}")
+    rule()
+
+    # -- tickets (WARM entities; phase is the saga cursor) ----------------- #
+    row("COMMITMENTS")
+    row("  TICKET    VENDOR  PHASE          STATUS   ESC  CREDIT  ANCHOR")
+    if not tickets:
+        row("  (no commitments in memory - run: session1)")
+    for t in tickets:
+        glyph = _PHASE_GLYPH.get(t["phase"], "?")
+        tx = t.get("attestation_tx_hash")
+        anchor = (tx[:10] + "…") if tx else "-"
+        row(f"  {t['ticket_id']:<9} {t['vendor_id']:<7} {glyph} {t['phase']:<12} "
+            f"{t['status']:<8} {t['escalation_level']:<4} {t['resolution_credit']:<6}  {anchor}")
+    rule()
+
+    # -- vendor reputation (WARM, derived; feeds forward into policy) ------ #
+    row("VENDOR REPUTATION (derived from history -> feeds the next consequence)")
+    for vid in vendor_ids:
+        v = memory.vendor_reputation(vid)
+        bar_n = int(round(v["reliability"] * 10))
+        bar = "█" * bar_n + "░" * (10 - bar_n)
+        row(f"  {vid:<7} {_TIER_LABEL.get(v['tier'], v['tier']):<10} reliability {bar} "
+            f"{v['reliability']:.0%}   breaches {v['breaches']}/{v['commitments']}  "
+            f"credit {v['total_credit_charged']}")
+    rule()
+
+    # -- consequence ledger (COLD journal; evaluated/acted/forward) -------- #
+    row("CONSEQUENCE LEDGER (append-only: evaluated -> acted -> forward)")
+    events = memory.ledger(limit=6)
+    if not events:
+        row("  (empty)")
+    for ev in events:
+        kind = ev.get("extra", {}).get("kind", ev.get("kind", "?"))
+        tid = ev.get("extra", {}).get("ticket_id", ev.get("ticket_id", "?"))
+        transition = ev.get("acted", {}).get("transition", "")
+        row(f"  [{kind:<6}] {tid:<9} {transition}")
+    rule("└", "┘")
+    out.append("read-only view · no saga advance · no broadcast · memory is the product")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 DEMO_TICKET = (
@@ -635,7 +716,7 @@ def main():
     parser = argparse.ArgumentParser(description="Continuum accountability runtime")
     parser.add_argument("command", choices=[
         "session1", "session2", "session3", "attest", "create-ticket", "resolve-ticket",
-        "check-deadlines", "vendor", "ledger", "clear-memory", "doctor",
+        "check-deadlines", "vendor", "ledger", "dashboard", "clear-memory", "doctor",
     ])
     parser.add_argument("target", nargs="?", default="T-1042",
                         help="ticket_id (or vendor_id for the 'vendor' command)")
@@ -679,6 +760,15 @@ def main():
         print(json.dumps(memory.vendor_reputation(args.target), indent=2, default=str))
     elif args.command == "ledger":
         print(json.dumps(memory.ledger(limit=50), indent=2, default=str))
+    elif args.command == "dashboard":
+        # Pure read-only projection of durable memory; never advances the saga.
+        # The view uses box/block glyphs, so ensure UTF-8 output on consoles
+        # (e.g. the default Windows code page) that would otherwise choke on them.
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+        print(render_dashboard(memory))
     elif args.command in ("session2", "session3"):
         # Detect and record the breach from fresh memory; never broadcasts.
         _run(memory, args.target, allow_attestation=False)

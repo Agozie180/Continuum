@@ -107,7 +107,13 @@ Inspect the accumulated memory:
 ```powershell
 python continuum.py vendor V-001        # derived vendor reputation
 python continuum.py ledger              # the append-only evaluated/acted/forward journal
+python continuum.py dashboard           # read-only at-a-glance view of all of the above
 ```
+
+`dashboard` is a pure projection of durable Sibyl memory — agent reputation, every
+commitment with its saga phase, derived vendor reputation, and the ledger tail. It never
+advances the saga and never broadcasts, so it is safe to run at any point. (Render it to a
+PNG with `python tools/shoot_dashboard.py`, which needs `Pillow`.)
 
 `InMemoryStore` in `continuum.py` exists **only** for the unit tests
 (`python -m unittest test_continuum.py`); it is never used in production.
