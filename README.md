@@ -3,13 +3,17 @@
 Continuum is a **memory-powered accountability runtime** for autonomous agents. When a
 vendor makes a commitment ("we'll resolve this by Friday"), Continuum records it as
 durable, structured memory in **Sibyl**, then drives a *resumable* workflow off that
-memory: detect the breach, decide a consequence, coordinate it through **Virtuals ACP**,
-and anchor a tamper-evident attestation on **Base Sepolia**.
+memory: detect the breach, decide a consequence, and anchor a tamper-evident attestation
+on **Base Sepolia**.
 
 The point of the project is the memory. Continuum accumulates institutional knowledge
 about how reliable each vendor is and feeds it forward into future decisions, so the
 *same* lateness costs a repeat offender more than a first-timer. Delete Sibyl and there
 is no state, no recall, and no consequence — memory is the product, not a cache.
+
+The runtime is fully functional with **Sibyl + Base alone**. Virtuals ACP is not on the
+core path; a clean, unwired integration seam (`VirtualsCoordinator`) is kept for when ACP
+credentials exist, and it is a real client — never a fake.
 
 ## Memory architecture
 
@@ -37,25 +41,30 @@ as a queryable `vendor/<id>` entity and the `agent_reputation` state document.
 `AccountabilityRuntime` advances a ticket through explicit phases:
 
 ```
-OPEN ──deadline passed──► BREACHED ──► COORDINATED ──► ATTESTED ──► CLOSED
-  │
-  └─ deadline not passed ─► stays OPEN (no consequence)
+OPEN ──deadline passed──► BREACHED ──explicit attest──► ATTESTED ──► CLOSED
+  │                          │
+  └─ deadline not passed ────┤  breach is durably recorded here; the on-chain
+     stays OPEN              │  attestation is a separate, opt-in step
+     (no consequence)        
 ```
 
 Each arrow is guarded **only by durable state** (`phase` plus the presence of a result
-like `virtuals_event_id` or `attestation_tx_hash`), and it persists to Sibyl before and
-after any external side effect. `process()` drives the ticket to a fixpoint, so a run
-resumes from wherever the previous one stopped:
+like `attestation_tx_hash`), and it persists to Sibyl before and after any external side
+effect. `process()` drives the ticket to a fixpoint, so a run resumes from wherever the
+previous one stopped:
 
-- A crash after breach detection but before coordination resumes **at coordination** — it
-  is not skipped (this is the root defect the rebuild fixes).
-- A crash after coordination but before attestation resumes **at attestation**, and does
-  **not** re-coordinate.
-- Re-running a `CLOSED` ticket fires no arrow and makes no partner calls.
+- Breach **detection** is pure memory work and always runs (`OPEN → BREACHED`).
+- On-chain **attestation** is the one irreversible side effect, so it fires **only under
+  an explicit opt-in** (`allow_attestation` / the `attest` command). Without it the saga
+  rests safely at `BREACHED`; routine processing and the deadline sweep never spend
+  on-chain by accident.
+- A crash after breach detection but before attestation resumes **at attestation** and
+  re-uses the same durable breach — it is never lost or re-counted.
+- Re-running a `CLOSED` ticket fires no arrow and makes no external calls.
 
-Idempotency is enforced at the source: Virtuals receives `breach_event_id` as its
-idempotency key, and the Base transaction intent (nonce + payload hash) is persisted
-*before* broadcast, so a retry re-sends the identical transaction on the same nonce.
+Idempotency is enforced at the source: the Base transaction intent (nonce + payload hash)
+is persisted *before* broadcast, so a crash-retry re-sends the identical transaction on
+the same nonce instead of double-spending.
 
 ## Reproduce
 
@@ -70,12 +79,12 @@ python continuum.py doctor
 ```
 
 `doctor` prints the memory backend, the resolved Sibyl DB path and tenant, the ticket
-count, and whether the Base/Virtuals credentials are configured.
+count, whether Base credentials are configured, and that attestation is an explicit
+opt-in.
 
-Production execution requires Sibyl, Base Sepolia credentials, and a real Virtuals ACP
-endpoint. There is **no** JSON or local-development substitute. Configure
-`SIBYL_MEMORY_DB`, `SIBYL_TENANT_ID`, `BASE_PRIVATE_KEY`, `BASE_RPC_URL`,
-`VIRTUALS_ACP_URL`, and `VIRTUALS_API_KEY` in `.env`; never commit `.env`.
+Production execution requires **Sibyl** and **Base Sepolia** credentials. There is **no**
+JSON or local-development substitute for either. Configure `SIBYL_MEMORY_DB`,
+`SIBYL_TENANT_ID`, `BASE_PRIVATE_KEY`, and `BASE_RPC_URL` in `.env`; never commit `.env`.
 
 ## Fresh-session demo (memory is load-bearing)
 
@@ -83,14 +92,15 @@ endpoint. There is **no** JSON or local-development substitute. Configure
 python continuum.py clear-memory        # start from empty Sibyl memory
 python continuum.py session1            # writes T-1042 to Sibyl (phase=OPEN), then exits
 # --- process fully terminates; nothing is held in RAM ---
-python continuum.py session2 T-1042     # a NEW process recalls T-1042 and acts on it
+python continuum.py session2 T-1042     # a NEW process recalls T-1042 and records the breach
+python continuum.py attest  T-1042      # deliberate on-chain step: real Base Sepolia tx
 ```
 
 Session 2 shares no memory with session 1 except Sibyl. It recalls the ticket, sees the
-promised date is in the past, transitions `OPEN → BREACHED`, and records the consequence.
-With Virtuals/Base credentials configured it continues to `COORDINATED → ATTESTED →
-CLOSED`; without them it reports the pending step and the persisted breach, and the next
-run resumes from there. Running `session2` again is idempotent.
+promised date is in the past, transitions `OPEN → BREACHED`, records the consequence, and
+**stops** — it does not broadcast. `attest` is the explicit step that anchors the breach
+on-chain (`BREACHED → ATTESTED → CLOSED`); if a crash interrupts it, the next `attest`
+resumes on the same transaction nonce. Every command is idempotent.
 
 Inspect the accumulated memory:
 
@@ -104,10 +114,14 @@ python continuum.py ledger              # the append-only evaluated/acted/forwar
 
 ## Partner boundaries
 
-Virtuals must return a durable `event_id` for the breach workflow. Base must be Base
-Sepolia (`chain_id=84532`); Continuum writes only hashes, the promised date, and the
-breach timestamp to the transaction calldata. Customer identifiers and issue text never
-leave Sibyl.
+Base must be Base Sepolia (`chain_id=84532`); Continuum writes only hashes, the promised
+date, and the breach timestamp to the transaction calldata. Customer identifiers and issue
+text never leave Sibyl.
+
+Virtuals ACP is an **optional, off-path** integration. `VirtualsCoordinator` is a real
+client kept as a clean seam; it is not wired into the runtime and is never faked. To
+enable it later, restore a `virtuals_event_id` field, add a non-blocking `BREACHED` branch
+that records the event id, and supply `VIRTUALS_ACP_URL` / `VIRTUALS_API_KEY`.
 
 ## Prior Work
 
