@@ -3,7 +3,7 @@
 Continuum turns vendor commitments into durable, structured memory in Sibyl,
 then drives a *resumable* accountability workflow off that memory:
 
-    detect breach -> escalate -> coordinate (Virtuals) -> attest (Base) -> close
+    detect breach -> decide consequence -> attest on-chain (Base) -> close
 
 Sibyl does the load-bearing work across three memory tiers (see ``SibylMemory``):
 
@@ -15,6 +15,15 @@ Sibyl does the load-bearing work across three memory tiers (see ``SibylMemory``)
 Reputation is DERIVED from durable ticket history (never blindly incremented, so
 reprocessing a breach can't double-count it) and fed FORWARD into the consequence
 policy: a repeat-offending vendor is escalated harder for the same lateness.
+
+The only external side effect on the core path is the Base Sepolia attestation.
+It broadcasts a real transaction, so it is an EXPLICIT, opt-in step
+(``allow_attestation`` / the ``attest`` command) - never a side effect of routine
+breach detection or a deadline sweep.
+
+Virtuals ACP is deliberately NOT on the core path. The runtime is fully functional
+with Sibyl + Base alone. ``VirtualsCoordinator`` remains as a clean, unwired
+integration seam - a real client, never a fake - for when ACP credentials exist.
 
 Remove Sibyl and there is no state, no recall, and no consequence - memory is the
 product. There is deliberately no JSON / local-development substitute.
@@ -68,14 +77,14 @@ def digest(value: str) -> str:
 # --------------------------------------------------------------------------- #
 # Ticket schema - a ticket is one commitment; ``phase`` is the saga cursor
 # --------------------------------------------------------------------------- #
-PHASES = ("OPEN", "BREACHED", "COORDINATED", "ATTESTED", "CLOSED")
+PHASES = ("OPEN", "BREACHED", "ATTESTED", "CLOSED")
 STATUSES = ("pending", "broken", "resolved")
 
 REQUIRED_FIELDS = {
     "ticket_id", "customer_id", "vendor_id", "issue_summary",
     "promise_made", "promised_date", "status", "phase",
     "escalation_count", "escalation_level", "resolution_credit",
-    "vendor_tier_at_breach", "breach_event_id", "virtuals_event_id",
+    "vendor_tier_at_breach", "breach_event_id",
     "attestation_intent", "attestation_tx_hash", "attestation_timestamp",
     "resolved_at", "last_action",
 }
@@ -97,7 +106,6 @@ def new_ticket(ticket_id, customer_id, vendor_id, issue_summary, promise_made, p
         "resolution_credit": 0,
         "vendor_tier_at_breach": None,
         "breach_event_id": None,
-        "virtuals_event_id": None,
         "attestation_intent": None,
         "attestation_tx_hash": None,
         "attestation_timestamp": None,
@@ -343,7 +351,7 @@ class InMemoryStore:
 
 
 # --------------------------------------------------------------------------- #
-# Partner integrations - no local substitute; production requires real creds
+# External effects - Base attestation (real, on the core path)
 # --------------------------------------------------------------------------- #
 class PartnerNotConfigured(RuntimeError):
     """A partner's credentials are absent.
@@ -357,48 +365,13 @@ class PartnerError(RuntimeError):
     """A configured partner call failed (bad response, wrong chain, etc.)."""
 
 
-class VirtualsCoordinator:
-    """Coordinates the breach consequence through a Virtuals ACP workflow.
-
-    ``breach_event_id`` is passed as the idempotency key so a retry can never
-    double-fire the downstream consequence on the Virtuals side.
-    """
-
-    def coordinate(self, ticket):
-        url, key = os.getenv("VIRTUALS_ACP_URL"), os.getenv("VIRTUALS_API_KEY")
-        if not url or not key:
-            raise PartnerNotConfigured("Virtuals ACP credentials are required; no local substitute exists")
-        import requests
-
-        response = requests.post(
-            url,
-            json={
-                "workflow": "continuum-accountability-v1",
-                "idempotency_key": ticket["breach_event_id"],
-                "ticket": {
-                    "ticket_id_hash": digest(ticket["ticket_id"]),
-                    "vendor_id_hash": digest(ticket["vendor_id"]),
-                    "escalation_level": ticket["escalation_level"],
-                    "credit": ticket["resolution_credit"],
-                },
-            },
-            headers={"Authorization": "Bearer " + key},
-            timeout=30,
-        )
-        response.raise_for_status()
-        body = response.json()
-        event_id = body.get("event_id") if isinstance(body, dict) else None
-        if not isinstance(event_id, str) or not event_id:
-            raise PartnerError("Virtuals response lacks event_id")
-        return event_id
-
-
 class BaseAttestor:
     """Writes a tamper-evident breach attestation to Base Sepolia.
 
     The signed-transaction intent (nonce + payload hash) is persisted BEFORE
     broadcast, so a crash-retry re-sends the identical transaction on the same
-    nonce instead of double-spending.
+    nonce instead of double-spending. This is the only external side effect on
+    the core path, and the runtime only ever calls it under an explicit opt-in.
     """
 
     def payload(self, ticket):
@@ -444,17 +417,22 @@ class BaseAttestor:
 # --------------------------------------------------------------------------- #
 # Workflow - a resumable saga
 #
-# Each arrow is guarded ONLY by durable state (``phase`` + result presence), so
-# a crash at any arrow resumes from exactly that arrow and never double-acts.
-# This is the root fix for the old control flow, where coordination was nested
-# inside the breach-detection branch and was silently skipped on recovery.
+# Phases: OPEN -> BREACHED -> ATTESTED -> CLOSED. Each arrow is guarded ONLY by
+# durable state (``phase`` + the presence of a result like ``attestation_tx_hash``),
+# so a crash at any arrow resumes from exactly that arrow and never double-acts.
+#
+# Breach detection (OPEN -> BREACHED) is pure memory work and always runs. The
+# ATTESTED arrow broadcasts a real Base transaction, so it fires ONLY when the
+# caller opts in via ``allow_attestation``; otherwise the saga reaches a safe
+# fixpoint at BREACHED and resumes later. This keeps routine processing and the
+# deadline sweep from ever spending on-chain by accident.
 # --------------------------------------------------------------------------- #
 class AccountabilityRuntime:
-    def __init__(self, memory, coordinator=None, attestor=None, clock=now):
+    def __init__(self, memory, attestor=None, clock=now, allow_attestation=False):
         self.memory = memory
-        self.coordinator = coordinator or VirtualsCoordinator()
         self.attestor = attestor or BaseAttestor()
         self.clock = clock
+        self.allow_attestation = allow_attestation
 
     def process(self, ticket_id):
         """Drive a ticket to a fixpoint: keep advancing until no arrow fires."""
@@ -470,8 +448,7 @@ class AccountabilityRuntime:
     def _advance(self, ticket):
         transitions = {
             "OPEN": self._open_to_breached,
-            "BREACHED": self._breached_to_coordinated,
-            "COORDINATED": self._coordinated_to_attested,
+            "BREACHED": self._breached_to_attested,
             "ATTESTED": self._attested_to_closed,
         }
         return transitions.get(ticket["phase"], lambda t: t)(ticket)
@@ -518,20 +495,11 @@ class AccountabilityRuntime:
         )
         return ticket
 
-    def _breached_to_coordinated(self, ticket):
-        if not ticket.get("virtuals_event_id"):
-            ticket["virtuals_event_id"] = self.coordinator.coordinate(ticket)
-        ticket.update(phase="COORDINATED", last_action="virtuals coordination recorded")
-        self.memory.put(ticket)
-        self.memory.append_ledger(
-            ticket["ticket_id"], "coordinate",
-            evaluated={"breach_event_id": ticket["breach_event_id"]},
-            acted={"transition": "BREACHED->COORDINATED", "virtuals_event_id": ticket["virtuals_event_id"]},
-            forward={"next": "on-chain attestation"},
-        )
-        return ticket
-
-    def _coordinated_to_attested(self, ticket):
+    def _breached_to_attested(self, ticket):
+        # The on-chain broadcast is the one irreversible side effect, so it fires
+        # only on an explicit opt-in. Without it the saga rests safely at BREACHED.
+        if not self.allow_attestation:
+            return ticket
         if not ticket.get("attestation_tx_hash"):
             tx_hash, ts = self.attestor.submit(ticket, self.memory)
             ticket.update(attestation_tx_hash=tx_hash, attestation_timestamp=ts)
@@ -539,9 +507,13 @@ class AccountabilityRuntime:
         self.memory.put(ticket)
         self.memory.append_ledger(
             ticket["ticket_id"], "attest",
-            evaluated={"virtuals_event_id": ticket["virtuals_event_id"]},
-            acted={"transition": "COORDINATED->ATTESTED", "attestation_tx_hash": ticket["attestation_tx_hash"]},
-            forward={"next": "close accountability cycle"},
+            evaluated={
+                "breach_event_id": ticket["breach_event_id"],
+                "escalation_level": ticket["escalation_level"],
+                "resolution_credit": ticket["resolution_credit"],
+            },
+            acted={"transition": "BREACHED->ATTESTED", "attestation_tx_hash": ticket["attestation_tx_hash"]},
+            forward={"anchored_on": "base-sepolia", "next": "close accountability cycle"},
         )
         return ticket
 
@@ -576,6 +548,56 @@ def resolve_ticket(memory, ticket_id, clock=now):
 
 
 # --------------------------------------------------------------------------- #
+# Optional integrations - NOT on the core path
+#
+# Continuum is fully functional with Sibyl + Base alone. The class below is a
+# clean, real integration seam for Virtuals ACP, kept so coordination can be
+# added later without reshaping the core. It is deliberately NOT wired into
+# ``AccountabilityRuntime`` and is never faked or stubbed.
+#
+# To enable it later: (1) restore a ``virtuals_event_id`` field on the ticket
+# schema, (2) add a non-blocking BREACHED-branch that records the event id, and
+# (3) supply VIRTUALS_ACP_URL / VIRTUALS_API_KEY. Until real ACP credentials
+# exist, the honest state is simply "not integrated".
+# --------------------------------------------------------------------------- #
+class VirtualsCoordinator:
+    """Coordinates a breach consequence through a Virtuals ACP workflow.
+
+    ``breach_event_id`` is passed as the idempotency key so a retry can never
+    double-fire the downstream consequence on the Virtuals side. This is a real
+    client against a real endpoint; there is intentionally no local substitute.
+    """
+
+    def coordinate(self, ticket):
+        url, key = os.getenv("VIRTUALS_ACP_URL"), os.getenv("VIRTUALS_API_KEY")
+        if not url or not key:
+            raise PartnerNotConfigured("Virtuals ACP credentials are required; no local substitute exists")
+        import requests
+
+        response = requests.post(
+            url,
+            json={
+                "workflow": "continuum-accountability-v1",
+                "idempotency_key": ticket["breach_event_id"],
+                "ticket": {
+                    "ticket_id_hash": digest(ticket["ticket_id"]),
+                    "vendor_id_hash": digest(ticket["vendor_id"]),
+                    "escalation_level": ticket["escalation_level"],
+                    "credit": ticket["resolution_credit"],
+                },
+            },
+            headers={"Authorization": "Bearer " + key},
+            timeout=30,
+        )
+        response.raise_for_status()
+        body = response.json()
+        event_id = body.get("event_id") if isinstance(body, dict) else None
+        if not isinstance(event_id, str) or not event_id:
+            raise PartnerError("Virtuals response lacks event_id")
+        return event_id
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 DEMO_TICKET = (
@@ -585,14 +607,16 @@ DEMO_TICKET = (
 )
 
 
-def _run(memory, ticket_id):
+def _run(memory, ticket_id, allow_attestation=False):
     """Drive one ticket through the saga and print the outcome.
 
-    If a partner is simply unconfigured, the breach is still durably recorded;
-    we report the pending step rather than crashing, and a later run resumes.
+    With ``allow_attestation`` false (the default for session2/session3) the run
+    detects and durably records the breach but never broadcasts; it reports the
+    persisted state and how to attest. If Base is simply unconfigured during an
+    attest, the breach still stands and a later run resumes from exactly there.
     """
     try:
-        ticket = AccountabilityRuntime(memory).process(ticket_id)
+        ticket = AccountabilityRuntime(memory, allow_attestation=allow_attestation).process(ticket_id)
     except PartnerNotConfigured as exc:
         print(json.dumps({"ticket": memory.get(ticket_id), "pending": str(exc)}, indent=2, default=str))
         return
@@ -600,12 +624,17 @@ def _run(memory, ticket_id):
         print(f"No Sibyl memory found for {ticket_id}")
         return
     print(json.dumps(ticket, indent=2, default=str))
+    if ticket["phase"] == "BREACHED" and not allow_attestation:
+        print(
+            f"\nBreach recorded in Sibyl. On-chain attestation is an explicit step:\n"
+            f"  python continuum.py attest {ticket_id}   # broadcasts a real Base Sepolia transaction"
+        )
 
 
 def main():
     parser = argparse.ArgumentParser(description="Continuum accountability runtime")
     parser.add_argument("command", choices=[
-        "session1", "session2", "session3", "create-ticket", "resolve-ticket",
+        "session1", "session2", "session3", "attest", "create-ticket", "resolve-ticket",
         "check-deadlines", "vendor", "ledger", "clear-memory", "doctor",
     ])
     parser.add_argument("target", nargs="?", default="T-1042",
@@ -626,7 +655,10 @@ def main():
             "sibyl_tenant": SIBYL_TENANT,
             "tickets": len(memory.all()),
             "base_configured": bool(os.getenv("BASE_PRIVATE_KEY") and os.getenv("BASE_RPC_URL")),
-            "virtuals_configured": bool(os.getenv("VIRTUALS_API_KEY") and os.getenv("VIRTUALS_ACP_URL")),
+            "attestation": "explicit opt-in (run: attest <ticket_id>)",
+            "optional_integrations": {
+                "virtuals_acp": bool(os.getenv("VIRTUALS_API_KEY") and os.getenv("VIRTUALS_ACP_URL")),
+            },
         }, indent=2))
     elif args.command == "clear-memory":
         memory.clear()
@@ -648,14 +680,17 @@ def main():
     elif args.command == "ledger":
         print(json.dumps(memory.ledger(limit=50), indent=2, default=str))
     elif args.command in ("session2", "session3"):
-        _run(memory, args.target)
+        # Detect and record the breach from fresh memory; never broadcasts.
+        _run(memory, args.target, allow_attestation=False)
+    elif args.command == "attest":
+        # The deliberate, opt-in on-chain step: this broadcasts a real transaction.
+        print(f"Attesting {args.target} on Base Sepolia (broadcasts a real transaction)...")
+        _run(memory, args.target, allow_attestation=True)
     elif args.command == "check-deadlines":
+        # Batch breach detection across all open commitments; never broadcasts.
         for ticket in memory.all():
             if ticket["phase"] != "CLOSED" and ticket["status"] != "resolved":
-                try:
-                    AccountabilityRuntime(memory).process(ticket["ticket_id"])
-                except PartnerNotConfigured:
-                    pass
+                AccountabilityRuntime(memory).process(ticket["ticket_id"])
 
 
 if __name__ == "__main__":

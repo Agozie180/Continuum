@@ -16,16 +16,9 @@ def at(year, month, day):
     return lambda: datetime(year, month, day, tzinfo=timezone.utc)
 
 
-class Coordinator:
-    def __init__(self):
-        self.calls = 0
-
-    def coordinate(self, ticket):
-        self.calls += 1
-        return f"virt-{self.calls}"
-
-
 class Attestor:
+    """A Base attestor double: no chain, no broadcast, just a counted call."""
+
     def __init__(self):
         self.calls = 0
 
@@ -34,8 +27,10 @@ class Attestor:
         return f"0xhash-{self.calls}", "2026-01-01T00:00:00+00:00"
 
 
-def runtime(store, coord, att, clock):
-    return AccountabilityRuntime(store, coord, att, clock)
+def runtime(store, att, clock, allow_attestation=True):
+    """Build a runtime. Tests opt into attestation by default (the double is
+    safe); the gate test below exercises the broadcast-safe path explicitly."""
+    return AccountabilityRuntime(store, attestor=att, clock=clock, allow_attestation=allow_attestation)
 
 
 class PolicyTests(unittest.TestCase):
@@ -59,59 +54,53 @@ class WorkflowTests(unittest.TestCase):
     def test_fresh_recall_drives_full_cycle(self):
         store = InMemoryStore()
         self._open(store)
-        result = runtime(store, Coordinator(), Attestor(), at(2020, 1, 3)).process("T")
+        result = runtime(store, Attestor(), at(2020, 1, 3)).process("T")
         self.assertEqual(result["phase"], "CLOSED")
         self.assertEqual(result["status"], "broken")
         self.assertTrue(result["breach_event_id"])
-        self.assertEqual(result["virtuals_event_id"], "virt-1")
         self.assertEqual(result["attestation_tx_hash"], "0xhash-1")
 
     def test_future_deadline_has_no_consequence(self):
         store = InMemoryStore()
         self._open(store, date="2099-01-01T00:00:00+00:00")
-        result = runtime(store, Coordinator(), Attestor(), at(2026, 1, 1)).process("T")
+        result = runtime(store, Attestor(), at(2026, 1, 1)).process("T")
         self.assertEqual(result["phase"], "OPEN")
         self.assertEqual(result["status"], "pending")
+
+    def test_attestation_requires_explicit_opt_in(self):
+        # The core-path safety property: routine processing detects and records
+        # the breach but must NEVER broadcast on-chain without an explicit opt-in.
+        store = InMemoryStore()
+        self._open(store)
+        att = Attestor()
+
+        breached = runtime(store, att, at(2020, 1, 3), allow_attestation=False).process("T")
+        self.assertEqual(breached["phase"], "BREACHED")
+        self.assertEqual(att.calls, 0)  # no broadcast attempted
+        self.assertIsNone(store.get("T")["attestation_tx_hash"])
+
+        # Opting in completes the cycle, reusing the same durable breach.
+        closed = runtime(store, att, at(2020, 1, 3), allow_attestation=True).process("T")
+        self.assertEqual(att.calls, 1)
+        self.assertEqual(closed["phase"], "CLOSED")
+        self.assertTrue(closed["attestation_tx_hash"])
+        self.assertEqual(closed["escalation_count"], 1)  # breach not re-counted
 
     def test_idempotent_rerun_makes_no_duplicate_calls(self):
         store = InMemoryStore()
         self._open(store)
-        coord, att = Coordinator(), Attestor()
-        runtime(store, coord, att, at(2020, 1, 3)).process("T")
+        att = Attestor()
+        runtime(store, att, at(2020, 1, 3)).process("T")
         # A second, later run (a fresh process would look identical) must be a no-op.
-        again = runtime(store, coord, att, at(2020, 1, 9)).process("T")
-        self.assertEqual(coord.calls, 1)
+        again = runtime(store, att, at(2020, 1, 9)).process("T")
         self.assertEqual(att.calls, 1)
         self.assertEqual(again["escalation_count"], 1)
         self.assertEqual(again["resolution_credit"], store.get("T")["resolution_credit"])
 
-    def test_crash_after_breach_still_coordinates_on_recovery(self):
-        # Regression test for the root defect: a breach is durably persisted but
-        # Virtuals never ran. A recovery run MUST coordinate before attesting.
-        # The old code nested coordination inside the breach branch and skipped it.
-        store = InMemoryStore()
-        self._open(store)
-
-        class Boom(Coordinator):
-            def coordinate(self, ticket):
-                raise RuntimeError("virtuals down")
-
-        with self.assertRaises(RuntimeError):
-            runtime(store, Boom(), Attestor(), at(2020, 1, 3)).process("T")
-
-        crashed = store.get("T")
-        self.assertEqual(crashed["phase"], "BREACHED")
-        self.assertIsNone(crashed["virtuals_event_id"])
-        self.assertIsNone(crashed["attestation_tx_hash"])
-
-        coord, att = Coordinator(), Attestor()
-        recovered = runtime(store, coord, att, at(2020, 1, 3)).process("T")
-        self.assertEqual(coord.calls, 1)  # coordination WAS reached on recovery
-        self.assertEqual(recovered["virtuals_event_id"], "virt-1")
-        self.assertEqual(recovered["attestation_tx_hash"], "0xhash-1")
-        self.assertEqual(recovered["phase"], "CLOSED")
-
-    def test_crash_before_attestation_resumes_without_recoordinating(self):
+    def test_crash_after_breach_resumes_at_attestation(self):
+        # Regression test for the resumable saga: a breach is durably persisted,
+        # but attestation crashes. A recovery run MUST reach attestation exactly
+        # once and close the cycle - the breach is never lost or re-counted.
         store = InMemoryStore()
         self._open(store)
 
@@ -119,16 +108,19 @@ class WorkflowTests(unittest.TestCase):
             def submit(self, ticket, store):
                 raise RuntimeError("base down")
 
-        coord = Coordinator()
         with self.assertRaises(RuntimeError):
-            runtime(store, coord, Boom(), at(2020, 1, 3)).process("T")
-        self.assertEqual(store.get("T")["phase"], "COORDINATED")
-        self.assertEqual(coord.calls, 1)
+            runtime(store, Boom(), at(2020, 1, 3), allow_attestation=True).process("T")
+
+        crashed = store.get("T")
+        self.assertEqual(crashed["phase"], "BREACHED")
+        self.assertEqual(crashed["escalation_count"], 1)
+        self.assertIsNone(crashed["attestation_tx_hash"])
 
         att = Attestor()
-        recovered = runtime(store, coord, att, at(2020, 1, 3)).process("T")
-        self.assertEqual(coord.calls, 1)  # NOT re-coordinated
-        self.assertEqual(att.calls, 1)
+        recovered = runtime(store, att, at(2020, 1, 3), allow_attestation=True).process("T")
+        self.assertEqual(att.calls, 1)  # attestation WAS reached on recovery
+        self.assertEqual(recovered["escalation_count"], 1)  # breach not re-counted
+        self.assertTrue(recovered["attestation_tx_hash"])
         self.assertEqual(recovered["phase"], "CLOSED")
 
 
@@ -138,7 +130,7 @@ class ReputationTests(unittest.TestCase):
         # A vendor breaches two prior commitments.
         for tid in ("A", "B"):
             store.put(new_ticket(tid, "C", "V-BAD", "i", "p", "2020-01-01T00:00:00+00:00"))
-            runtime(store, Coordinator(), Attestor(), at(2020, 1, 5)).process(tid)
+            runtime(store, Attestor(), at(2020, 1, 5)).process(tid)
         rep = store.vendor_reputation("V-BAD")
         self.assertEqual(rep["breaches"], 2)
         self.assertEqual(rep["tier"], "high-risk")
@@ -146,8 +138,8 @@ class ReputationTests(unittest.TestCase):
         # Same lateness, two vendors: the repeat offender is escalated harder.
         store.put(new_ticket("C1", "C", "V-BAD", "i", "p", "2020-01-01T00:00:00+00:00"))
         store.put(new_ticket("D1", "C", "V-GOOD", "i", "p", "2020-01-01T00:00:00+00:00"))
-        bad = runtime(store, Coordinator(), Attestor(), at(2020, 1, 3)).process("C1")
-        good = runtime(store, Coordinator(), Attestor(), at(2020, 1, 3)).process("D1")
+        bad = runtime(store, Attestor(), at(2020, 1, 3)).process("C1")
+        good = runtime(store, Attestor(), at(2020, 1, 3)).process("D1")
         self.assertGreater(bad["resolution_credit"], good["resolution_credit"])
         self.assertGreater(bad["escalation_level"], good["escalation_level"])
         self.assertEqual(bad["vendor_tier_at_breach"], "high-risk")
@@ -157,8 +149,8 @@ class ReputationTests(unittest.TestCase):
         store = InMemoryStore()
         store.put(new_ticket("T-A", "C-500", "V-AAA", "i", "p", "2020-01-01T00:00:00+00:00"))
         store.put(new_ticket("T-B", "C-500", "V-BBB", "i", "p", "2099-01-01T00:00:00+00:00"))
-        runtime(store, Coordinator(), Attestor(), at(2026, 1, 1)).process("T-A")
-        runtime(store, Coordinator(), Attestor(), at(2026, 1, 1)).process("T-B")
+        runtime(store, Attestor(), at(2026, 1, 1)).process("T-A")
+        runtime(store, Attestor(), at(2026, 1, 1)).process("T-B")
         self.assertEqual(store.get("T-A")["status"], "broken")
         self.assertEqual(store.get("T-B")["status"], "pending")
         self.assertEqual(store.vendor_reputation("V-BBB")["breaches"], 0)
@@ -172,7 +164,7 @@ class SchemaAndResolutionTests(unittest.TestCase):
     def test_broken_ticket_cannot_regress_to_pending(self):
         store = InMemoryStore()
         store.put(new_ticket("T", "C", "V", "i", "p", "2020-01-01T00:00:00+00:00"))
-        runtime(store, Coordinator(), Attestor(), at(2020, 1, 3)).process("T")
+        runtime(store, Attestor(), at(2020, 1, 3)).process("T")
         stale = new_ticket("T", "C", "V", "i", "p", "2020-01-01T00:00:00+00:00")
         with self.assertRaises(ValueError):
             store.put(stale)
