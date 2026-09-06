@@ -1,0 +1,26 @@
+{
+  "network": "Base Sepolia",
+  "chain_id": 84532,
+  "verified_at": "2026-09-06",
+  "transactions": [
+    {
+      "ticket_id": "T-2077",
+      "hash": "0xc6c762a75cffcac2b454fb1e64e0496c847f1767934fc9ca1f064c37f3fe9499",
+      "status": 1,
+      "explorer": "https://sepolia.basescan.org/tx/0xc6c762a75cffcac2b454fb1e64e0496c847f1767934fc9ca1f064c37f3fe9499"
+    },
+    {
+      "ticket_id": "T-3001",
+      "hash": "0xdfb2f6d19460bdd1217a0bee8acbc7f5dc19b4971d003127b30d181f46b572dd",
+      "status": 1,
+      "explorer": "https://sepolia.basescan.org/tx/0xdfb2f6d19460bdd1217a0bee8acbc7f5dc19b4971d003127b30d181f46b572dd"
+    },
+    {
+      "ticket_id": "T-1042",
+      "hash": "0xc4139e1ef3e51bf39130ccc11b5ae4517a9f9db2b4d6930c8dcd6237357a80be",
+      "status": 1,
+      "explorer": "https://sepolia.basescan.org/tx/0xc4139e1ef3e51bf39130ccc11b5ae4517a9f9db2b4d6930c8dcd6237357a80be"
+    }
+  ],
+  "payload_policy": "Only hashed identifiers, commitment hash, promised date, and breach timestamp are written; customer IDs and issue text remain in Sibyl."
+}

@@ -15,6 +15,14 @@ The runtime is fully functional with **Sibyl + Base alone**. Virtuals ACP is not
 core path; a clean, unwired integration seam (`VirtualsCoordinator`) is kept for when ACP
 credentials exist, and it is a real client — never a fake.
 
+### The 30-second pitch
+
+Autonomous agents can make promises but usually cannot remember, enforce, or prove them.
+Continuum turns each promise into a durable accountability object: Sibyl remembers it,
+deterministic policy detects a breach and prices the consequence, and Base Sepolia records
+a privacy-safe proof of what happened. The next session inherits the prior history, so
+repeat failures cost more. This is accountability infrastructure, not a support chatbot.
+
 ## Memory architecture
 
 All state lives in Sibyl, across three of its tiers. Everything is in
@@ -88,6 +96,17 @@ JSON or local-development substitute for either. Configure `SIBYL_MEMORY_DB`,
 
 ## Fresh-session demo (memory is load-bearing)
 
+For a judge-safe run that uses a temporary Sibyl database and leaves repository data
+untouched:
+
+```powershell
+python tools/judge_demo.py
+```
+
+The recorded judge demo is [`output/continuum_demo.mp4`](output/continuum_demo.mp4).
+Regenerate it with `python tools/record_demo.py`; it executes the real CLI against a
+temporary Sibyl database and does not broadcast a transaction.
+
 ```powershell
 python continuum.py clear-memory        # start from empty Sibyl memory
 python continuum.py session1            # writes T-1042 to Sibyl (phase=OPEN), then exits
@@ -118,6 +137,10 @@ PNG with `python tools/shoot_dashboard.py`, which needs `Pillow`.)
 `InMemoryStore` in `continuum.py` exists **only** for the unit tests
 (`python -m unittest test_continuum.py`); it is never used in production.
 
+The demo deliberately stops before broadcasting. To show the real Base step, configure a
+funded Base Sepolia key in a private `.env`, then run `python continuum.py attest T-1042`.
+Never commit that key. The local `.env` shipped with this repository contains no secrets.
+
 ## Partner boundaries
 
 Base must be Base Sepolia (`chain_id=84532`); Continuum writes only hashes, the promised
@@ -128,6 +151,37 @@ Virtuals ACP is an **optional, off-path** integration. `VirtualsCoordinator` is 
 client kept as a clean seam; it is not wired into the runtime and is never faked. To
 enable it later, restore a `virtuals_event_id` field, add a non-blocking `BREACHED` branch
 that records the event id, and supply `VIRTUALS_ACP_URL` / `VIRTUALS_API_KEY`.
+
+There is no Virtuals-native execution claim in this submission. ACP access was unavailable,
+so Virtuals partner credit should be treated as zero. The core product remains complete
+without it.
+
+## Base evidence
+
+The persisted transaction hashes in [`evidence/base-sepolia.json`](evidence/base-sepolia.json)
+were independently checked on Base Sepolia (`chain_id=84532`) and returned successful
+receipts. The explorer links are public. Calldata contains only hashed identifiers,
+commitment hash, promised date, and breach timestamp; customer IDs and issue text stay in
+Sibyl.
+
+## Why this can be a product
+
+Continuum is aimed first at agent operators, marketplaces, and vendor platforms where a
+missed promise has a measurable cost. Their current options are reminders, tickets, or
+bespoke workflow code; none carries institutional reliability forward across independent
+agent sessions with a verifiable outcome record. A pilot can start with one commitment
+type, one deterministic credit policy, and Base attestations enabled only for material
+breaches. The product metric is simple: fewer repeated breaches and faster, auditable
+recovery.
+
+## Submission checklist
+
+- `python -m pytest -q` passes all tests.
+- `python tools/judge_demo.py` proves fresh-process Sibyl recall and idempotency.
+- Base Sepolia evidence and explorer links are in `evidence/base-sepolia.json`.
+- Virtuals is explicitly unverified and off the core path; no fabricated execution is used.
+- Local credentials are blank and `.env` is ignored by Git.
+- Read [`SECURITY.md`](SECURITY.md) before any public deployment; previously exposed local credentials must be rotated.
 
 ## Prior Work
 
