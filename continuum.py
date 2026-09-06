@@ -388,14 +388,44 @@ class BaseAttestor:
         if not os.getenv("BASE_PRIVATE_KEY") or not os.getenv("BASE_RPC_URL"):
             raise PartnerNotConfigured("Base credentials are required; no local substitute exists")
         from web3 import Web3
+        from web3.exceptions import TransactionNotFound
 
         w3 = Web3(Web3.HTTPProvider(os.environ["BASE_RPC_URL"]))
         if w3.eth.chain_id != BASE_SEPOLIA_CHAIN_ID:
             raise PartnerError(f"Base Sepolia ({BASE_SEPOLIA_CHAIN_ID}) is required")
         account = w3.eth.account.from_key(os.environ["BASE_PRIVATE_KEY"])
         payload = self.payload(ticket)
+        payload_hash = digest(json.dumps(payload, sort_keys=True))
         intent = ticket.get("attestation_intent")
-        nonce = intent["nonce"] if intent else w3.eth.get_transaction_count(account.address, "pending")
+        if intent:
+            if intent.get("payload_hash") != payload_hash:
+                raise PartnerError("persisted attestation intent does not match the breach payload")
+
+            # Reconcile an earlier broadcast before signing anything again. This
+            # covers a process crash or local persistence failure after send.
+            recorded_hash = intent.get("tx_hash")
+            if not recorded_hash:
+                raise PartnerError("persisted attestation intent lacks tx_hash")
+            try:
+                receipt = w3.eth.get_transaction_receipt(recorded_hash)
+            except TransactionNotFound:
+                receipt = None
+            if receipt is not None:
+                if receipt.get("status") != 1:
+                    raise PartnerError(f"Base transaction failed: {recorded_hash}")
+                return w3.to_hex(recorded_hash), iso(now())
+            try:
+                pending = w3.eth.get_transaction(recorded_hash)
+            except TransactionNotFound:
+                pending = None
+            if pending is not None:
+                receipt = w3.eth.wait_for_transaction_receipt(recorded_hash)
+                if receipt.get("status") != 1:
+                    raise PartnerError(f"Base transaction failed: {recorded_hash}")
+                return w3.to_hex(recorded_hash), iso(now())
+            nonce = intent["nonce"]
+        else:
+            nonce = w3.eth.get_transaction_count(account.address, "pending")
         tx = {
             "from": account.address, "to": account.address, "value": 0,
             "data": w3.to_hex(text=json.dumps(payload, separators=(",", ":"))),
@@ -407,11 +437,26 @@ class BaseAttestor:
         if not intent:  # persist intent before broadcast -> nonce-stable replay
             ticket["attestation_intent"] = {
                 "tx_hash": tx_hash, "nonce": nonce,
-                "payload_hash": digest(json.dumps(payload, sort_keys=True)),
+                "payload_hash": payload_hash,
             }
             store.put(ticket)
-        w3.eth.send_raw_transaction(signed.raw_transaction)
-        w3.eth.wait_for_transaction_receipt(tx_hash)
+        elif tx_hash != intent["tx_hash"]:
+            raise PartnerError("reconstructed attestation does not match persisted transaction intent")
+        try:
+            w3.eth.send_raw_transaction(signed.raw_transaction)
+        except Exception as exc:
+            # A node may report an ambiguous send even though the transaction
+            # propagated. Reconcile once before surfacing the failure.
+            try:
+                receipt = w3.eth.get_transaction_receipt(tx_hash)
+            except TransactionNotFound:
+                receipt = None
+            if receipt is not None and receipt.get("status") == 1:
+                return tx_hash, iso(now())
+            raise exc
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+        if receipt.get("status") != 1:
+            raise PartnerError(f"Base transaction failed: {tx_hash}")
         return tx_hash, iso(now())
 
 

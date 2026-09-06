@@ -1,5 +1,9 @@
 import unittest
+import os
+import sys
+import types
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from continuum import (
     AccountabilityRuntime,
@@ -8,6 +12,8 @@ from continuum import (
     consequence,
     new_ticket,
     resolve_ticket,
+    BaseAttestor,
+    PartnerError,
 )
 
 
@@ -176,6 +182,57 @@ class SchemaAndResolutionTests(unittest.TestCase):
         rep = store.vendor_reputation("V")
         self.assertEqual(rep["breaches"], 0)
         self.assertEqual(rep["on_time_resolutions"], 1)
+
+
+class BaseRecoveryTests(unittest.TestCase):
+    def _ticket(self):
+        ticket = new_ticket("T", "C", "V", "private issue", "private promise", "2020-01-01T00:00:00+00:00")
+        ticket.update(phase="BREACHED", status="broken", breach_event_id="2020-01-03T00:00:00+00:00")
+        return ticket
+
+    def _fake_web3(self, ticket, receipt):
+        payload = BaseAttestor().payload(ticket)
+        payload_hash = __import__("continuum").digest(__import__("json").dumps(payload, sort_keys=True))
+        ticket["attestation_intent"] = {"tx_hash": "0xexisting", "nonce": 7, "payload_hash": payload_hash}
+
+        class Eth:
+            chain_id = 84532
+            account = types.SimpleNamespace(from_key=lambda key: types.SimpleNamespace(address="0xabc"))
+
+            def get_transaction_receipt(self, tx_hash):
+                return receipt
+
+        class FakeWeb3:
+            def __init__(self, provider):
+                self.eth = Eth()
+
+            @staticmethod
+            def HTTPProvider(url):
+                return url
+
+            @staticmethod
+            def to_hex(value):
+                return value
+
+        fake_web3 = types.ModuleType("web3")
+        fake_web3.Web3 = FakeWeb3
+        fake_exceptions = types.ModuleType("web3.exceptions")
+        fake_exceptions.TransactionNotFound = type("TransactionNotFound", (Exception,), {})
+        return fake_web3, fake_exceptions, ticket
+
+    def test_reconciles_mined_transaction_without_resubmitting(self):
+        fake_web3, fake_exceptions, ticket = self._fake_web3(self._ticket(), {"status": 1})
+        with patch.dict(os.environ, {"BASE_PRIVATE_KEY": "key", "BASE_RPC_URL": "rpc"}), \
+             patch.dict(sys.modules, {"web3": fake_web3, "web3.exceptions": fake_exceptions}):
+            tx_hash, _ = BaseAttestor().submit(ticket, InMemoryStore())
+        self.assertEqual(tx_hash, "0xexisting")
+
+    def test_rejects_failed_mined_transaction(self):
+        fake_web3, fake_exceptions, ticket = self._fake_web3(self._ticket(), {"status": 0})
+        with patch.dict(os.environ, {"BASE_PRIVATE_KEY": "key", "BASE_RPC_URL": "rpc"}), \
+             patch.dict(sys.modules, {"web3": fake_web3, "web3.exceptions": fake_exceptions}):
+            with self.assertRaises(PartnerError):
+                BaseAttestor().submit(ticket, InMemoryStore())
 
 
 if __name__ == "__main__":
