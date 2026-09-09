@@ -7,3 +7,6 @@ __pycache__/
 data/*.db
 data/*.db-wal
 data/*.db-shm
+
+# Generated demo videos (regenerate with tools/record_demo.py / record_professional_demo.py)
+output/*.mp4
