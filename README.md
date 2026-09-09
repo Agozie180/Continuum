@@ -109,9 +109,10 @@ untouched:
 python tools/judge_demo.py
 ```
 
-The recorded judge demo is [`output/continuum_demo.mp4`](output/continuum_demo.mp4).
-Regenerate it with `python tools/record_demo.py`; it executes the real CLI against a
-temporary Sibyl database and does not broadcast a transaction.
+Generate a recorded walkthrough with `python tools/record_demo.py`; it executes the real
+CLI against a temporary Sibyl database, does not broadcast a transaction, and writes
+`output/continuum_demo.mp4` locally (the video is generated on demand, not committed to
+the repository).
 
 ```powershell
 python continuum.py clear-memory        # start from empty Sibyl memory
