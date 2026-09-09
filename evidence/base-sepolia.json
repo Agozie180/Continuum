@@ -1,7 +1,7 @@
 {
   "network": "Base Sepolia",
   "chain_id": 84532,
-  "verified_at": "2026-09-06",
+  "verified_at": "2026-09-09",
   "transactions": [
     {
       "ticket_id": "T-2077",
@@ -20,7 +20,14 @@
       "hash": "0xc4139e1ef3e51bf39130ccc11b5ae4517a9f9db2b4d6930c8dcd6237357a80be",
       "status": 1,
       "explorer": "https://sepolia.basescan.org/tx/0xc4139e1ef3e51bf39130ccc11b5ae4517a9f9db2b4d6930c8dcd6237357a80be"
+    },
+    {
+      "ticket_id": "T-4050",
+      "hash": "0xab7861c4f3deb5b8048f352d878269aa11812a47aeffd4e84b593659d3ee0285",
+      "status": 1,
+      "explorer": "https://sepolia.basescan.org/tx/0xab7861c4f3deb5b8048f352d878269aa11812a47aeffd4e84b593659d3ee0285",
+      "note": "first attestation to commit a remedy_hash; issued remedy RM-3a75604218fd"
     }
   ],
-  "payload_policy": "Only hashed identifiers, commitment hash, promised date, and breach timestamp are written; customer IDs and issue text remain in Sibyl."
+  "payload_policy": "Only hashed identifiers, commitment hash, remedy hash, promised date, and breach timestamp are written; customer IDs and issue text remain in Sibyl."
 }

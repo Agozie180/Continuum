@@ -3,7 +3,7 @@
 Continuum turns vendor commitments into durable, structured memory in Sibyl,
 then drives a *resumable* accountability workflow off that memory:
 
-    detect breach -> decide consequence -> attest on-chain (Base) -> close
+    detect breach -> issue remedy -> attest on-chain (Base) -> close
 
 Sibyl does the load-bearing work across three memory tiers (see ``SibylMemory``):
 
@@ -85,7 +85,7 @@ REQUIRED_FIELDS = {
     "ticket_id", "customer_id", "vendor_id", "issue_summary",
     "promise_made", "promised_date", "status", "phase",
     "escalation_count", "escalation_level", "resolution_credit",
-    "vendor_tier_at_breach", "breach_event_id",
+    "vendor_tier_at_breach", "breach_event_id", "remedy",
     "attestation_intent", "attestation_tx_hash", "attestation_timestamp",
     "resolved_at", "last_action",
 }
@@ -107,6 +107,7 @@ def new_ticket(ticket_id, customer_id, vendor_id, issue_summary, promise_made, p
         "resolution_credit": 0,
         "vendor_tier_at_breach": None,
         "breach_event_id": None,
+        "remedy": None,
         "attestation_intent": None,
         "attestation_tx_hash": None,
         "attestation_timestamp": None,
@@ -116,6 +117,7 @@ def new_ticket(ticket_id, customer_id, vendor_id, issue_summary, promise_made, p
 
 
 def validate(ticket):
+    ticket.setdefault("remedy", None)  # backward-compat for rows written before remedies existed
     missing = REQUIRED_FIELDS - set(ticket)
     if missing:
         raise ValueError("ticket missing required fields: " + ", ".join(sorted(missing)))
@@ -175,6 +177,27 @@ def consequence(days_late: int, prior_tier: str) -> dict:
     return {
         "escalation_level": base_escalation_level(days_late) + _TIER_ESCALATION_BUMP[prior_tier],
         "resolution_credit": round(base_credit(days_late) * _REPEAT_CREDIT_FACTOR[prior_tier]),
+    }
+
+
+def build_remedy(ticket_id, breach_event_id, decided) -> dict:
+    """The concrete remedy the runtime ISSUES when a breach is detected.
+
+    A remedy is the *decision made actionable*: a customer credit memo and a
+    vendor penalty, both priced by the deterministic ``consequence`` policy. It
+    is issued (recorded as owed), not settled (funds moved) - settlement is an
+    optional, off-path step. The ``remedy_id`` is a pure function of the ticket
+    and its breach event, so re-processing the same breach rebuilds the identical
+    remedy instead of issuing a second one (idempotent by construction).
+    """
+    remedy_id = "RM-" + digest(f"{ticket_id}|{breach_event_id}")[:12]
+    return {
+        "remedy_id": remedy_id,
+        "customer_credit": decided["resolution_credit"],
+        "vendor_penalty_level": decided["escalation_level"],
+        "status": "issued",       # issued -> (optionally) settled; see settlement note
+        "settlement": "pending",  # moving funds is explicitly off the core path
+        "issued_at": breach_event_id,
     }
 
 
@@ -376,12 +399,17 @@ class BaseAttestor:
     """
 
     def payload(self, ticket):
+        remedy = ticket.get("remedy")
         return {
             "vendor_id_hash": digest(ticket["vendor_id"]),
             "ticket_id_hash": digest(ticket["ticket_id"]),
             "commitment_hash": digest(ticket["promise_made"]),
             "promised_date": ticket["promised_date"],
             "breached_at": ticket["breach_event_id"],
+            # Commit to the remedy on-chain: the hash proves *what was owed* without
+            # exposing amounts. None hashes to a stable sentinel, so the payload is
+            # well-defined even for a legacy breach recorded before remedies existed.
+            "remedy_hash": digest(json.dumps(remedy, sort_keys=True) if remedy else "no-remedy"),
         }
 
     def submit(self, ticket, store):
@@ -507,15 +535,18 @@ class AccountabilityRuntime:
 
         prior = self.memory.vendor_reputation(ticket["vendor_id"], exclude_ticket_id=ticket["ticket_id"])
         decided = consequence(max(1, int(days_late)), prior["tier"])
+        breach_event_id = iso(self.clock())
+        remedy = build_remedy(ticket["ticket_id"], breach_event_id, decided)
         ticket.update(
             status="broken",
             phase="BREACHED",
-            breach_event_id=iso(self.clock()),
+            breach_event_id=breach_event_id,
             escalation_count=ticket["escalation_count"] + 1,
             escalation_level=decided["escalation_level"],
             resolution_credit=decided["resolution_credit"],
             vendor_tier_at_breach=prior["tier"],
-            last_action="deadline breach detected",
+            remedy=remedy,
+            last_action="deadline breach detected; remedy issued",
         )
         self.memory.put(ticket)
         after = self.memory.refresh_reputation(ticket["vendor_id"])
@@ -532,6 +563,8 @@ class AccountabilityRuntime:
                 "transition": "OPEN->BREACHED",
                 "escalation_level": decided["escalation_level"],
                 "resolution_credit": decided["resolution_credit"],
+                "remedy_id": remedy["remedy_id"],
+                "remedy_status": remedy["status"],
             },
             forward={
                 "vendor_reliability": after["reliability"],
@@ -654,35 +687,43 @@ class VirtualsCoordinator:
 # Glyphs chosen to render in the common terminal fonts (notably Consolas, which
 # lacks the half-circle glyphs): empty ring -> lozenge -> solid square (anchored)
 # -> full circle (done), a legible "increasing completion" progression.
+# Phase chips: a filled progression the eye reads as "closer to done", chosen to
+# render in the common terminal fonts (notably Consolas): ring -> diamond ->
+# square (anchored) -> disc (closed). Every chip ships with its text label too,
+# so identity never rests on color or glyph alone.
 _PHASE_GLYPH = {"OPEN": "○", "BREACHED": "◊", "ATTESTED": "■", "CLOSED": "●"}
 _TIER_LABEL = {"trusted": "TRUSTED", "standard": "STANDARD", "watch": "WATCH", "high-risk": "HIGH-RISK"}
 _DASHBOARD_WIDTH = 78
 
-# A single named palette drives both the ANSI terminal output and the PNG
-# render, so the two never drift. Values are RGB; the ANSI layer maps them to
-# 24-bit truecolor escapes.
+# One named palette drives both the ANSI terminal output and the PNG render, so
+# the two never drift. Every value is a documented step from the data-viz
+# reference palette, tuned for a dark surface (#0d1117) and contrast-verified on
+# it (data text >= 3:1, primary ink >= 4.5:1). Colors here carry *status*
+# meaning (phase / tier / kind), so each is always paired with a text label and a
+# glyph - the reference's icon+label relief rule - never asked to separate
+# categories by hue alone. RGB; the ANSI layer maps to 24-bit truecolor.
 PALETTE = {
-    "fg": (201, 209, 217),      # default text
-    "dim": (110, 118, 129),     # captions, hashes, table headings
-    "border": (88, 166, 255),   # frame - blue
-    "title": (86, 211, 255),    # CONTINUUM - cyan
-    "brand": (63, 185, 80),     # "memory: Sibyl" - green
-    "section": (210, 168, 255), # section headings - purple
-    "id": (121, 192, 255),      # ticket ids - light blue
-    "open": (88, 166, 255),     # phase: OPEN - blue
-    "breached": (233, 180, 76), # phase: BREACHED - amber
-    "attested": (210, 168, 255),# phase: ATTESTED - purple
-    "closed": (63, 185, 80),    # phase: CLOSED - green
-    "good": (63, 185, 80),      # green (resolved, trusted, filled bar)
-    "warn": (233, 180, 76),     # amber (watch, pending)
-    "bad": (248, 120, 120),     # red (broken, high-risk, breach)
-    "cyan": (86, 211, 255),
-    "magenta": (210, 168, 255),
+    "fg":      (230, 237, 243),  # #e6edf3  primary ink        (16.0:1)
+    "dim":     (139, 148, 158),  # #8b949e  secondary ink       (6.2:1)
+    "faint":   (110, 118, 129),  # #6e7681  captions, hashes    (4.1:1)
+    "border":  (48, 54, 61),     # #30363d  recessive hairline  (chrome, <3:1 by design)
+    "title":   (134, 182, 239),  # #86b6ef  brand wordmark      (9.0:1)
+    "brand":   (12, 163, 12),    # #0ca30c  "memory · Sibyl"    (5.6:1)
+    "section": (144, 133, 233),  # #9085e9  panel headings      (6.1:1)
+    "id":      (57, 135, 229),   # #3987e5  identifiers         (5.2:1)
+    "kpi":     (134, 182, 239),  # #86b6ef  KPI stat values     (9.0:1)
+    "good":    (12, 163, 12),    # #0ca30c  status: good        (5.6:1)
+    "warn":    (250, 178, 25),   # #fab219  status: warning     (10.3:1)
+    "serious": (236, 131, 90),   # #ec835a  status: serious     (7.2:1)
+    "bad":     (208, 59, 59),    # #d03b3b  status: critical    (3.9:1)
 }
-_PHASE_COLOR = {"OPEN": "open", "BREACHED": "breached", "ATTESTED": "attested", "CLOSED": "closed"}
-_TIER_COLOR = {"trusted": "good", "standard": "cyan", "watch": "warn", "high-risk": "bad"}
+# Semantic role -> palette key. Kept out of the layout code so the mapping reads
+# as one legend and a re-theme touches nothing else.
+_PHASE_COLOR = {"OPEN": "id", "BREACHED": "warn", "ATTESTED": "section", "CLOSED": "good"}
+_TIER_COLOR = {"trusted": "good", "standard": "id", "watch": "warn", "high-risk": "bad"}
 _STATUS_COLOR = {"pending": "warn", "broken": "bad", "resolved": "good"}
-_KIND_COLOR = {"breach": "bad", "attest": "magenta", "close": "good"}
+_KIND_COLOR = {"breach": "bad", "attest": "section", "close": "good"}
+_SETTLEMENT_COLOR = {"pending": "warn", "settled": "good"}
 
 
 def _dashboard_rows(memory):
@@ -696,80 +737,108 @@ def _dashboard_rows(memory):
     tickets = sorted(memory.all(), key=lambda t: t["ticket_id"])
     agent = memory.agent_reputation()
     vendor_ids = sorted({t["vendor_id"] for t in tickets})
+    remedies = sum(1 for t in tickets if t.get("remedy"))
     W = _DASHBOARD_WIDTH
+    IN = W - 1  # printable interior width between the side borders
     rows = []
 
     def frame(segments):
         # Pad to a uniform interior width (computed on visible text only, so
         # color never throws the right border off) and add the side borders.
         visible = sum(len(t) for t, _ in segments)
-        pad = max(0, W - 1 - visible)
+        pad = max(0, IN - visible)
         rows.append([("│", "border"), (" ", "fg"), *segments, (" " * pad, "fg"), ("│", "border")])
 
     def rule(left="├", right="┤"):
         rows.append([(left + "─" * W + right, "border")])
 
+    def band(cells):
+        # A row of evenly spaced (text, color) cells - the KPI stat-band grid.
+        col = IN // len(cells)
+        segs = []
+        for text, color in cells:
+            segs.append((f"{text:<{col}}", color))
+        frame(segs)
+
+    # -- header ------------------------------------------------------------ #
     rule("┌", "┐")
-    head = [("CONTINUUM", "title"), (" · accountability runtime", "dim")]
-    tail = "memory: Sibyl"
-    gap = W - 1 - sum(len(t) for t, _ in head) - len(tail)
+    head = [("● ", "brand"), ("CONTINUUM", "title"), ("  accountability runtime", "dim")]
+    tail = "memory · Sibyl"
+    gap = IN - 1 - sum(len(t) for t, _ in head) - len(tail)
     rows.append([("│", "border"), (" ", "fg"), *head, (" " * max(0, gap), "fg"),
                  (tail, "brand"), (" ", "fg"), ("│", "border")])
     rule()
 
-    # -- agent reputation (HOT state, compounding) ------------------------- #
-    frame([("AGENT REPUTATION ", "section"), ("(compounding, derived from durable history)", "dim")])
-    frame([("  tickets=", "dim"), (str(agent["tickets_processed"]), "fg"),
-           ("  breaches=", "dim"), (str(agent["breaches_detected"]), "bad"),
-           ("  escalations=", "dim"), (str(agent["escalations_issued"]), "warn"),
-           ("  credit_recovered=", "dim"), (str(agent["credit_recovered"]), "good"),
-           ("  attestations=", "dim"), (str(agent["attestations_created"]), "magenta")])
+    # -- KPI stat-band (compounding agent reputation, at a glance) --------- #
+    band([("PROMISES", "dim"), ("BREACHES", "dim"), ("REMEDIES", "dim"),
+          ("CREDIT", "dim"), ("ANCHORED", "dim")])
+    band([(str(agent["promises_tracked"]), "kpi"), (str(agent["breaches_detected"]), "bad"),
+          (str(remedies), "serious"), (f"${agent['credit_recovered']}", "good"),
+          (str(agent["attestations_created"]), "section")])
     rule()
 
     # -- tickets (WARM entities; phase is the saga cursor) ----------------- #
-    frame([("COMMITMENTS", "section")])
-    frame([("  TICKET    VENDOR  PHASE          STATUS   ESC  CREDIT  ANCHOR", "dim")])
+    frame([("COMMITMENTS  ", "section"), ("promise → breach → remedy → on-chain anchor", "dim")])
+    frame([("  TICKET   VENDOR PHASE         ESC  CREDIT  REMEDY       ANCHOR", "faint")])
     if not tickets:
-        frame([("  (no commitments in memory - run: session1)", "dim")])
+        frame([("  no commitments in memory — run: session1", "dim")])
     for t in tickets:
         glyph = _PHASE_GLYPH.get(t["phase"], "?")
         pc = _PHASE_COLOR.get(t["phase"], "fg")
         tx = t.get("attestation_tx_hash")
-        anchor = (tx[:10] + "…") if tx else "-"
-        frame([("  ", "fg"), (f"{t['ticket_id']:<9} ", "id"), (f"{t['vendor_id']:<7} ", "fg"),
-               (f"{glyph} {t['phase']:<12} ", pc), (f"{t['status']:<8} ", _STATUS_COLOR.get(t["status"], "fg")),
-               (f"{t['escalation_level']:<4} ", "warn"), (f"{t['resolution_credit']:<6}  ", "good"),
-               (anchor, "dim")])
+        anchor = (tx[:12] + "…") if tx else "—"
+        remedy = t.get("remedy")
+        if remedy:
+            rem_text, rem_color = remedy["settlement"], _SETTLEMENT_COLOR.get(remedy["settlement"], "fg")
+        else:
+            rem_text, rem_color = "—", "faint"
+        credit = f"${t['resolution_credit']}" if t.get("breach_event_id") else "—"
+        frame([("  ", "fg"), (f"{t['ticket_id']:<8} ", "id"), (f"{t['vendor_id']:<6} ", "fg"),
+               (f"{glyph} ", pc), (f"{t['phase']:<11} ", pc),
+               (f"{t['escalation_level']:<4} ", "warn"), (f"{credit:<7} ", "good"),
+               (f"{rem_text:<12} ", rem_color), (anchor, "faint")])
     rule()
 
     # -- vendor reputation (WARM, derived; feeds forward into policy) ------ #
-    frame([("VENDOR REPUTATION ", "section"), ("(derived from history -> feeds the next consequence)", "dim")])
+    frame([("VENDOR REPUTATION  ", "section"), ("derived from history → prices the next breach", "dim")])
     for vid in vendor_ids:
         v = memory.vendor_reputation(vid)
-        bar_n = int(round(v["reliability"] * 10))
-        rel_color = "good" if v["reliability"] >= 0.6 else "warn" if v["reliability"] >= 0.3 else "bad"
-        frame([("  ", "fg"), (f"{vid:<7} ", "id"),
-               (f"{_TIER_LABEL.get(v['tier'], v['tier']):<10} ", _TIER_COLOR.get(v["tier"], "fg")),
-               ("reliability ", "dim"), ("█" * bar_n, rel_color), ("░" * (10 - bar_n), "dim"),
-               (f" {v['reliability']:.0%}", rel_color),
-               (f"   breaches {v['breaches']}/{v['commitments']}", "dim"),
-               (f"  credit {v['total_credit_charged']}", "dim")])
+        bar_n = int(round(v["reliability"] * 12))
+        rel_color = _TIER_COLOR.get(v["tier"], "fg")
+        frame([("  ", "fg"), (f"{vid:<6} ", "id"),
+               (f"{_TIER_LABEL.get(v['tier'], v['tier']):<9} ", rel_color),
+               ("█" * bar_n, rel_color), ("░" * (12 - bar_n), "border"),
+               (f" {v['reliability']:>4.0%} ", rel_color),
+               (f" breaches {v['breaches']}/{v['commitments']}", "dim"),
+               (f"  credit ${v['total_credit_charged']}", "dim")])
     rule()
 
     # -- consequence ledger (COLD journal; evaluated/acted/forward) -------- #
-    frame([("CONSEQUENCE LEDGER ", "section"), ("(append-only: evaluated -> acted -> forward)", "dim")])
+    frame([("CONSEQUENCE LEDGER  ", "section"), ("append-only: evaluated → acted → forward", "dim")])
     events = memory.ledger(limit=6)
     if not events:
-        frame([("  (empty)", "dim")])
+        frame([("  empty", "dim")])
     for ev in events:
-        kind = ev.get("extra", {}).get("kind", ev.get("kind", "?"))
-        tid = ev.get("extra", {}).get("ticket_id", ev.get("ticket_id", "?"))
-        transition = ev.get("acted", {}).get("transition", "")
-        frame([("  [", "dim"), (f"{kind:<6}", _KIND_COLOR.get(kind, "fg")), ("] ", "dim"),
-               (f"{tid:<9} ", "id"), (transition, "cyan")])
+        extra = ev.get("extra", {})
+        acted = ev.get("acted", {})
+        kind = extra.get("kind", ev.get("kind", "?"))
+        tid = extra.get("ticket_id", ev.get("ticket_id", "?"))
+        transition = acted.get("transition", "")
+        rid = acted.get("remedy_id", "")
+        frame([("  ", "fg"), (f"{glyph_for_kind(kind)} ", _KIND_COLOR.get(kind, "fg")),
+               (f"{kind:<7}", _KIND_COLOR.get(kind, "fg")),
+               (f"{tid:<8} ", "id"), (f"{transition:<18} ", "dim"),
+               (rid, "faint")])
     rule("└", "┘")
-    rows.append([("read-only view · no saga advance · no broadcast · memory is the product", "dim")])
+    rows.append([("read-only projection · no saga advance · no broadcast · memory is the product", "faint")])
     return rows
+
+
+_KIND_GLYPH = {"breach": "▲", "attest": "■", "close": "●"}
+
+
+def glyph_for_kind(kind):
+    return _KIND_GLYPH.get(kind, "•")
 
 
 _ANSI_RESET = "\x1b[0m"
@@ -824,11 +893,70 @@ def _run(memory, ticket_id, allow_attestation=False):
         )
 
 
+def verify_evidence():
+    """Independently re-check every persisted Base Sepolia receipt. Read-only.
+
+    Reads ``evidence/base-sepolia.json`` and, for each transaction, asks the
+    configured Base RPC to confirm the receipt succeeded (status == 1) on chain
+    84532, then decodes the calldata and asserts it carries only the privacy-safe
+    payload keys - no customer id, no issue text. This broadcasts nothing; it only
+    reads chain state. Needs BASE_RPC_URL; no private key is required or used.
+    """
+    evidence_path = ROOT / "evidence" / "base-sepolia.json"
+    if not evidence_path.exists():
+        print(json.dumps({"error": f"no evidence file at {evidence_path}"}, indent=2))
+        return
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    rpc = os.getenv("BASE_RPC_URL")
+    allowed_keys = {"vendor_id_hash", "ticket_id_hash", "commitment_hash",
+                    "promised_date", "breached_at", "remedy_hash"}
+    report = {"chain_id": evidence.get("chain_id"), "rpc_configured": bool(rpc), "transactions": []}
+    w3 = None
+    if rpc:
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider(rpc))
+
+    for tx in evidence.get("transactions", []):
+        row = {"ticket_id": tx.get("ticket_id"), "hash": tx.get("hash"), "explorer": tx.get("explorer")}
+        if w3 is None:
+            row["checked"] = False
+            row["note"] = "set BASE_RPC_URL to verify on-chain (recorded status={})".format(tx.get("status"))
+            report["transactions"].append(row)
+            continue
+        try:
+            receipt = w3.eth.get_transaction_receipt(tx["hash"])
+            onchain = w3.eth.get_transaction(tx["hash"])
+            row["chain_id_ok"] = (w3.eth.chain_id == evidence.get("chain_id") == BASE_SEPOLIA_CHAIN_ID)
+            row["receipt_status"] = int(receipt.get("status"))
+            row["status_ok"] = receipt.get("status") == 1
+            calldata = onchain.get("input")
+            text = bytes(calldata).decode("utf-8", "replace") if not isinstance(calldata, str) else \
+                bytes.fromhex(calldata[2:]).decode("utf-8", "replace")
+            payload = json.loads(text)
+            keys = set(payload)
+            row["calldata_keys"] = sorted(keys)
+            row["privacy_ok"] = keys.issubset(allowed_keys)
+            row["verified"] = bool(row["status_ok"] and row["chain_id_ok"] and row["privacy_ok"])
+        except Exception as exc:  # RPC hiccup, tx not found, decode failure - report, never crash
+            row["checked"] = False
+            row["error"] = f"{type(exc).__name__}: {exc}"
+        report["transactions"].append(row)
+
+    verified = [t for t in report["transactions"] if t.get("verified")]
+    report["summary"] = {
+        "total": len(report["transactions"]),
+        "verified": len(verified),
+        "note": "read-only receipt + calldata check; no transaction was broadcast",
+    }
+    print(json.dumps(report, indent=2, default=str))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Continuum accountability runtime")
     parser.add_argument("command", choices=[
         "session1", "session2", "session3", "attest", "create-ticket", "resolve-ticket",
-        "check-deadlines", "vendor", "ledger", "dashboard", "clear-memory", "doctor",
+        "check-deadlines", "vendor", "ledger", "dashboard", "verify-evidence",
+        "clear-memory", "doctor",
     ])
     parser.add_argument("target", nargs="?", default="T-1042",
                         help="ticket_id (or vendor_id for the 'vendor' command)")
@@ -872,6 +1000,9 @@ def main():
         print(json.dumps(memory.vendor_reputation(args.target), indent=2, default=str))
     elif args.command == "ledger":
         print(json.dumps(memory.ledger(limit=50), indent=2, default=str))
+    elif args.command == "verify-evidence":
+        # Read-only: re-check the persisted Base receipts on chain. Never broadcasts.
+        verify_evidence()
     elif args.command == "dashboard":
         # Pure read-only projection of durable memory; never advances the saga.
         # The view uses box/block glyphs, so ensure UTF-8 output on consoles

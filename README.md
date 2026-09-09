@@ -3,7 +3,8 @@
 Continuum is a **memory-powered accountability runtime** for autonomous agents. When a
 vendor makes a commitment ("we'll resolve this by Friday"), Continuum records it as
 durable, structured memory in **Sibyl**, then drives a *resumable* workflow off that
-memory: detect the breach, decide a consequence, and anchor a tamper-evident attestation
+memory: detect the breach, **issue a deterministic remedy** (a customer credit memo and a
+vendor penalty, priced by policy — not by an LLM), and anchor a tamper-evident attestation
 on **Base Sepolia**.
 
 The point of the project is the memory. Continuum accumulates institutional knowledge
@@ -19,9 +20,10 @@ credentials exist, and it is a real client — never a fake.
 
 Autonomous agents can make promises but usually cannot remember, enforce, or prove them.
 Continuum turns each promise into a durable accountability object: Sibyl remembers it,
-deterministic policy detects a breach and prices the consequence, and Base Sepolia records
-a privacy-safe proof of what happened. The next session inherits the prior history, so
-repeat failures cost more. This is accountability infrastructure, not a support chatbot.
+deterministic policy detects a breach, prices the consequence, and **issues a remedy**, and
+Base Sepolia records a privacy-safe proof of what happened. The next session inherits the
+prior history, so repeat failures cost more. This is accountability infrastructure, not a
+support chatbot.
 
 ## Memory architecture
 
@@ -30,7 +32,7 @@ All state lives in Sibyl, across three of its tiers. Everything is in
 
 | Tier | Sibyl primitive | What Continuum stores | Where |
 | --- | --- | --- | --- |
-| WARM | `set_entity("ticket", …)` | Per-commitment operational state **and the saga cursor** (`phase`) | `SibylMemory.put/get/all` |
+| WARM | `set_entity("ticket", …)` | Per-commitment operational state, the issued **remedy**, **and the saga cursor** (`phase`) | `SibylMemory.put/get/all` |
 | WARM | `set_entity("vendor", …)` | Institutional vendor reputation, **derived** from ticket history | `SibylMemory.refresh_reputation` |
 | HOT | `set_state("agent_reputation", …)` | Compounding agent-level counters | `SibylMemory.refresh_reputation` |
 | COLD | `write_event(evaluated, acted, forward)` | Append-only consequence ledger | `SibylMemory.append_ledger` |
@@ -51,8 +53,8 @@ as a queryable `vendor/<id>` entity and the `agent_reputation` state document.
 ```
 OPEN ──deadline passed──► BREACHED ──explicit attest──► ATTESTED ──► CLOSED
   │                          │
-  └─ deadline not passed ────┤  breach is durably recorded here; the on-chain
-     stays OPEN              │  attestation is a separate, opt-in step
+  └─ deadline not passed ────┤  breach + remedy are durably recorded here; the
+     stays OPEN              │  on-chain attestation is a separate, opt-in step
      (no consequence)        
 ```
 
@@ -61,7 +63,11 @@ like `attestation_tx_hash`), and it persists to Sibyl before and after any exter
 effect. `process()` drives the ticket to a fixpoint, so a run resumes from wherever the
 previous one stopped:
 
-- Breach **detection** is pure memory work and always runs (`OPEN → BREACHED`).
+- Breach **detection and remedy issuance** are pure memory work and always run
+  (`OPEN → BREACHED`). The remedy — a customer credit memo and a vendor penalty, priced by
+  the deterministic policy — is *issued* (recorded as owed) here; **settlement** (moving
+  funds) is deliberately left off the core path. Its id is a pure function of the ticket
+  and breach event, so reprocessing can never issue it twice.
 - On-chain **attestation** is the one irreversible side effect, so it fires **only under
   an explicit opt-in** (`allow_attestation` / the `attest` command). Without it the saga
   rests safely at `BREACHED`; routine processing and the deadline sweep never spend
@@ -111,15 +117,30 @@ temporary Sibyl database and does not broadcast a transaction.
 python continuum.py clear-memory        # start from empty Sibyl memory
 python continuum.py session1            # writes T-1042 to Sibyl (phase=OPEN), then exits
 # --- process fully terminates; nothing is held in RAM ---
-python continuum.py session2 T-1042     # a NEW process recalls T-1042 and records the breach
+python continuum.py session2 T-1042     # a NEW process recalls T-1042, breaches, issues a remedy
 python continuum.py attest  T-1042      # deliberate on-chain step: real Base Sepolia tx
 ```
 
 Session 2 shares no memory with session 1 except Sibyl. It recalls the ticket, sees the
-promised date is in the past, transitions `OPEN → BREACHED`, records the consequence, and
-**stops** — it does not broadcast. `attest` is the explicit step that anchors the breach
-on-chain (`BREACHED → ATTESTED → CLOSED`); if a crash interrupts it, the next `attest`
-resumes on the same transaction nonce. Every command is idempotent.
+promised date is in the past, transitions `OPEN → BREACHED`, records the consequence and a
+deterministic **remedy**, and **stops** — it does not broadcast. `attest` is the explicit
+step that anchors the breach on-chain (`BREACHED → ATTESTED → CLOSED`); if a crash
+interrupts it, the next `attest` resumes on the same transaction nonce. Every command is
+idempotent.
+
+**Memory feeds forward — the same lateness costs a repeat offender more.** Give the same
+vendor a second identical commitment and the history Sibyl carries changes the decision:
+
+```powershell
+python continuum.py create-ticket T-1043 --vendor-id V-001 --promised-date 2026-08-18T17:00:00+00:00
+python continuum.py session2 T-1043     # same lateness, but V-001 is now HIGH-RISK
+```
+
+The first breach (V-001 *trusted*) issues a $20 credit at escalation level 3; the second,
+for identical lateness, issues **$40 at level 5** — because Sibyl remembers the first
+breach and the policy prices repeat offenders higher. Delete Sibyl and the second breach
+would look exactly like the first. (`python tools/judge_demo.py` runs this whole sequence
+against a throwaway database and asserts the escalation.)
 
 Inspect the accumulated memory:
 
@@ -127,6 +148,7 @@ Inspect the accumulated memory:
 python continuum.py vendor V-001        # derived vendor reputation
 python continuum.py ledger              # the append-only evaluated/acted/forward journal
 python continuum.py dashboard           # read-only at-a-glance view of all of the above
+python continuum.py verify-evidence     # re-check the persisted Base receipts on-chain
 ```
 
 `dashboard` is a pure projection of durable Sibyl memory — agent reputation, every
@@ -143,9 +165,11 @@ Never commit that key. The local `.env` shipped with this repository contains no
 
 ## Partner boundaries
 
-Base must be Base Sepolia (`chain_id=84532`); Continuum writes only hashes, the promised
-date, and the breach timestamp to the transaction calldata. Customer identifiers and issue
-text never leave Sibyl.
+Base must be Base Sepolia (`chain_id=84532`); Continuum writes only hashes (of the vendor
+id, ticket id, commitment, and the issued remedy), the promised date, and the breach
+timestamp to the transaction calldata. Customer identifiers and issue text never leave
+Sibyl. The `remedy_hash` lets anyone prove *what was owed* against the on-chain record
+without exposing the amount.
 
 Virtuals ACP is an **optional, off-path** integration. `VirtualsCoordinator` is a real
 client kept as a clean seam; it is not wired into the runtime and is never faked. To
@@ -161,8 +185,18 @@ without it.
 The persisted transaction hashes in [`evidence/base-sepolia.json`](evidence/base-sepolia.json)
 were independently checked on Base Sepolia (`chain_id=84532`) and returned successful
 receipts. The explorer links are public. Calldata contains only hashed identifiers,
-commitment hash, promised date, and breach timestamp; customer IDs and issue text stay in
-Sibyl.
+commitment hash, remedy hash, promised date, and breach timestamp; customer IDs and issue
+text stay in Sibyl.
+
+Re-verify them yourself against a live RPC — this reads chain state and broadcasts nothing:
+
+```powershell
+python continuum.py verify-evidence     # confirms status==1, chain 84532, and privacy-safe calldata
+```
+
+For each transaction it fetches the receipt, checks the status and chain id, decodes the
+calldata, and asserts every key is in the privacy-safe allow-list (no customer id, no issue
+text). It needs only `BASE_RPC_URL`; no private key is used.
 
 ## Why this can be a product
 
@@ -174,11 +208,32 @@ type, one deterministic credit policy, and Base attestations enabled only for ma
 breaches. The product metric is simple: fewer repeated breaches and faster, auditable
 recovery.
 
+### Market & cost model (illustrative)
+
+The numbers below are an **illustrative** unit model to show the shape of the economics,
+not measured results or a forecast.
+
+- **Who pays and why now.** Marketplaces and agent operators are the buyers: as more vendor
+  interactions are handled by autonomous agents, "the agent said it would and then forgot"
+  becomes a recurring, unpriced liability. Continuum is the system of record that prices it.
+- **Where the value is.** A missed promise already has a cost — a credit, a churned
+  customer, an SLA penalty. Continuum's job is to *reduce repeat* breaches by carrying
+  reliability forward, and to make each outcome auditable.
+- **Illustrative unit math.** A platform tracking **10,000 commitments/month** at a **4%**
+  breach rate issues ≈ **400 remedies/month**; at an average **$18** credit that is
+  ≈ **$7,200/month** in priced, logged accountability flowing through one deterministic
+  policy. Anchoring only material breaches on Base Sepolia keeps per-event cost negligible
+  (calldata is a few hashes). The pitch to the buyer is that surfacing and pricing repeat
+  offenders shifts that breach rate down over time.
+- **Pricing.** A per-tracked-commitment fee (fractions of a cent) or a percentage of
+  credits administered — either way the cost is small next to the mispriced-liability it
+  replaces.
+
 ## Submission checklist
 
-- `python -m pytest -q` passes all tests.
-- `python tools/judge_demo.py` proves fresh-process Sibyl recall and idempotency.
-- Base Sepolia evidence and explorer links are in `evidence/base-sepolia.json`.
+- `python -m unittest test_continuum.py` passes all tests (18: policy, saga, reputation, remedy, Base recovery).
+- `python tools/judge_demo.py` proves fresh-process Sibyl recall, idempotency, and memory-driven escalation.
+- Base Sepolia evidence and explorer links are in `evidence/base-sepolia.json`; `python continuum.py verify-evidence` re-checks them on-chain.
 - Virtuals is explicitly unverified and off the core path; no fabricated execution is used.
 - Local credentials are blank and `.env` is ignored by Git.
 - Read [`SECURITY.md`](SECURITY.md) before any public deployment; previously exposed local credentials must be rotated.

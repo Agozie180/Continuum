@@ -16,7 +16,7 @@ from PIL import Image, ImageDraw, ImageFont
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import continuum as c  # noqa: E402
 
-BG = (13, 17, 23)  # dark ground, tuned to read like the hackathon site
+BG = (13, 17, 23)  # #0d1117 dark ground; every PALETTE color is contrast-verified against it
 PAD = 28
 LINE_SPACING = 6
 
