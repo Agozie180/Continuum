@@ -9,6 +9,7 @@ from continuum import (
     AccountabilityRuntime,
     InMemoryStore,
     base_credit,
+    build_remedy,
     consequence,
     new_ticket,
     resolve_ticket,
@@ -184,10 +185,59 @@ class SchemaAndResolutionTests(unittest.TestCase):
         self.assertEqual(rep["on_time_resolutions"], 1)
 
 
+class RemedyTests(unittest.TestCase):
+    def test_breach_issues_a_priced_remedy(self):
+        store = InMemoryStore()
+        store.put(new_ticket("T", "C", "V", "i", "p", "2020-01-01T00:00:00+00:00"))
+        breached = runtime(store, Attestor(), at(2020, 1, 5), allow_attestation=False).process("T")
+        remedy = breached["remedy"]
+        self.assertIsNotNone(remedy)
+        self.assertEqual(remedy["status"], "issued")
+        self.assertEqual(remedy["settlement"], "pending")  # issued, not settled
+        # The remedy carries the same deterministic price the policy decided.
+        self.assertEqual(remedy["customer_credit"], breached["resolution_credit"])
+        self.assertEqual(remedy["vendor_penalty_level"], breached["escalation_level"])
+
+    def test_remedy_id_is_deterministic_and_idempotent(self):
+        # Same ticket + same breach event -> byte-identical remedy id, so
+        # reprocessing a breach can never issue a second remedy.
+        decided = consequence(2, "trusted")
+        a = build_remedy("T-1042", "2026-08-19T00:00:00+00:00", decided)
+        b = build_remedy("T-1042", "2026-08-19T00:00:00+00:00", decided)
+        self.assertEqual(a["remedy_id"], b["remedy_id"])
+        self.assertTrue(a["remedy_id"].startswith("RM-"))
+        # A different breach event yields a different remedy id.
+        c = build_remedy("T-1042", "2026-09-01T00:00:00+00:00", decided)
+        self.assertNotEqual(a["remedy_id"], c["remedy_id"])
+
+    def test_rerun_does_not_reissue_or_mutate_the_remedy(self):
+        store = InMemoryStore()
+        store.put(new_ticket("T", "C", "V", "i", "p", "2020-01-01T00:00:00+00:00"))
+        first = runtime(store, Attestor(), at(2020, 1, 5), allow_attestation=False).process("T")
+        remedy_id = first["remedy"]["remedy_id"]
+        again = runtime(store, Attestor(), at(2020, 1, 9), allow_attestation=False).process("T")
+        self.assertEqual(again["remedy"]["remedy_id"], remedy_id)
+
+    def test_attestation_payload_commits_to_the_remedy(self):
+        store = InMemoryStore()
+        store.put(new_ticket("T", "C", "V", "i", "p", "2020-01-01T00:00:00+00:00"))
+        breached = runtime(store, Attestor(), at(2020, 1, 5), allow_attestation=False).process("T")
+        payload = BaseAttestor().payload(breached)
+        self.assertIn("remedy_hash", payload)
+        # The payload stays privacy-safe: only hashes + dates, no raw amounts or ids.
+        self.assertNotIn("customer_id", payload)
+        self.assertNotIn("remedy", payload)
+
+
 class BaseRecoveryTests(unittest.TestCase):
     def _ticket(self):
         ticket = new_ticket("T", "C", "V", "private issue", "private promise", "2020-01-01T00:00:00+00:00")
-        ticket.update(phase="BREACHED", status="broken", breach_event_id="2020-01-03T00:00:00+00:00")
+        breach_event_id = "2020-01-03T00:00:00+00:00"
+        decided = consequence(2, "trusted")
+        ticket.update(phase="BREACHED", status="broken", breach_event_id=breach_event_id,
+                      escalation_level=decided["escalation_level"],
+                      resolution_credit=decided["resolution_credit"],
+                      remedy=build_remedy("T", breach_event_id, decided))
         return ticket
 
     def _fake_web3(self, ticket, receipt):

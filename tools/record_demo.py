@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -26,47 +27,61 @@ def run_demo():
     with tempfile.TemporaryDirectory(prefix="continuum-video-") as dbdir:
         env = os.environ.copy()
         env["SIBYL_MEMORY_DB"] = str(Path(dbdir) / "sibyl.db")
+        env["PYTHONIOENCODING"] = "utf-8"
+        due = "2026-08-18T17:00:00+00:00"
         commands = [
             ("01  WRITE COMMITMENT TO SIBYL", [["clear-memory"], ["session1"]]),
-            ("02  NEW PROCESS RECALLS + DETECTS BREACH", [["session2", "T-1042"]]),
-            ("03  REPEAT RUN IS IDEMPOTENT", [["session2", "T-1042"]]),
+            ("02  NEW PROCESS: RECALL, BREACH, REMEDY", [["session2", "T-1042"]]),
+            ("03  MEMORY FEEDS FORWARD (SAME LATENESS COSTS MORE)",
+             [["create-ticket", "T-1043", "--vendor-id", "V-001", "--promised-date", due],
+              ["session2", "T-1043"]]),
             ("04  SIBYL DERIVES REPUTATION + LEDGER", [["vendor", "V-001"]]),
             ("05  HONEST PARTNER BOUNDARY", None),
         ]
         pages = []
+        first_credit = {}
         for title, args in commands:
             if args is None:
                 output = [
                     "Core product: HEALTHY without Virtuals credentials",
                     "Virtuals ACP: optional adapter, not verified live",
                     "Base Sepolia: explicit opt-in attestation step",
+                    "Receipts are independently checkable:",
+                    "  python continuum.py verify-evidence",
                     "",
                     "Next step (only with a funded key):",
-                    "python continuum.py attest T-1042",
+                    "  python continuum.py attest T-1042",
                 ]
             else:
                 output = []
+                last_stdout = ""  # only the final command in a step emits the JSON we parse
                 for command in args:
-                    p = subprocess.run(["python", str(ROOT / "continuum.py"), *command], env=env,
-                                       capture_output=True, text=True, check=True)
+                    p = subprocess.run([sys.executable, str(ROOT / "continuum.py"), *command], env=env,
+                                       capture_output=True, text=True, encoding="utf-8", check=True)
+                    last_stdout = p.stdout
                     output.extend(p.stdout.strip().splitlines())
                 if title.startswith("02"):
-                    payload = json.loads("\n".join(output).split("\n\nBreach recorded")[0])
+                    payload = json.loads(last_stdout.split("\n\nBreach recorded")[0])
+                    first_credit["v"] = payload["resolution_credit"]
                     output = [f"phase          = {payload['phase']}",
                               f"breach_event   = {payload['breach_event_id']}",
-                              f"credit         = {payload['resolution_credit']}",
+                              f"prior_tier     = {payload['vendor_tier_at_breach']}",
+                              f"credit         = ${payload['resolution_credit']}  (escalation {payload['escalation_level']})",
+                              f"remedy         = {payload['remedy']['remedy_id']} ({payload['remedy']['settlement']})",
                               "attestation     = explicit opt-in (not broadcast)"]
                 elif title.startswith("03"):
-                    payload = json.loads("\n".join(output).split("\n\nBreach recorded")[0])
-                    output = [f"phase          = {payload['phase']}",
-                              f"same breach id = {payload['breach_event_id']}",
-                              "ledger event    = unchanged; no duplicate consequence"]
+                    payload = json.loads(last_stdout.split("\n\nBreach recorded")[0])
+                    output = [f"same lateness, second commitment for V-001",
+                              f"prior_tier     = {payload['vendor_tier_at_breach']}  (was trusted)",
+                              f"credit         = ${payload['resolution_credit']}  (escalation {payload['escalation_level']})",
+                              f"first breach was ${first_credit.get('v', '?')} - memory raised the price",
+                              f"remedy         = {payload['remedy']['remedy_id']} ({payload['remedy']['settlement']})"]
                 elif title.startswith("04"):
-                    payload = json.loads("\n".join(output))
+                    payload = json.loads(last_stdout)
                     output = [f"vendor         = {payload['vendor_id']}",
                               f"tier           = {payload['tier']}",
-                              f"breaches       = {payload['breaches']}",
-                              f"credit charged = {payload['total_credit_charged']}"]
+                              f"breaches       = {payload['breaches']}/{payload['commitments']}",
+                              f"credit charged = ${payload['total_credit_charged']}"]
             pages.append((title, output))
         return pages
 

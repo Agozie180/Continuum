@@ -9,3 +9,7 @@ sibyl-memory-cli[mcp]==0.4.0
 # Optional: only needed to render the dashboard to a PNG (tools/shoot_dashboard.py).
 # The `dashboard` command itself needs nothing beyond the core deps.
 # Pillow>=10.0.0
+
+# Optional: only needed to regenerate the narrated submission video
+# (tools/record_professional_demo.py, which also needs Pillow and ffmpeg on PATH).
+# edge-tts>=6.1.0
